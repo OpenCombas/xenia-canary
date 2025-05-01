@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2021 Ben Vanik. All rights reserved.                             *
+ * Copyright 2025 Xenia Canary. All rights reserved.                          *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -10,13 +10,23 @@
 #include <span>
 
 #include "xenia/kernel/xam/apps/xlivebase_app.h"
-#include "xenia/kernel/xenumerator.h"
 
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/unmarshaller/generic_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/xaccount_getuserinfo_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/xinvite_send_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/xonline_query_search_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/xstorage_delete_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/xstorage_download_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/xstorage_enumerate_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/xstorage_upload_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/xstring_verify_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/xuser_findusers_unmarshaller.h"
+#include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xnet.h"
 #include "xenia/ui/imgui_host_notification.h"
 
@@ -51,13 +61,14 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
                                             uint32_t buffer_ptr,
                                             uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
-  auto buffer = memory_->TranslateVirtual(buffer_ptr);
+  uint8_t* buffer = memory_->TranslateVirtual<uint8_t*>(buffer_ptr);
 
   switch (message) {
     case 0x00050002: {
-      // Current session must have PRESENCE flag.
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XInviteSend({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return GenericMarshalled(buffer_ptr);
+      return XInviteSend(buffer_ptr);
     }
     case 0x00058003: {
       // Called on startup of dashboard (netplay build)
@@ -65,103 +76,144 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
       return X_ONLINE_S_LOGON_CONNECTION_ESTABLISHED;
     }
     case 0x0005008C: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XLiveBaseUnk5008C({:08X}, {:08X}) Stubbed", buffer_ptr,
              buffer_length);
       return Unkn5008C(buffer_ptr);
     }
     case 0x00050094: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       // Called on startup of blades dashboard v4532 to v4552
       XELOGD("XLiveBaseUnk50094({:08x}, {:08x}) unimplemented", buffer_ptr,
              buffer_length);
       return GenericMarshalled(buffer_ptr);
     }
     case 0x00050008: {
-      // Required to be successful for 534507D4
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
+      // 534507D4, 555307D7, 545107D1 - XStorageDownloadToMemory
       XELOGD("XStorageDelete({:08x}, {:08x})", buffer_ptr, buffer_length);
       return XStorageDelete(buffer_ptr);
     }
     case 0x00050009: {
-      // Fixes Xbox Live error for 513107D9
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
+      // 555307D7 - XStorageEnumerate
       XELOGD("XStorageDownloadToMemory({:08X}, {:08X})", buffer_ptr,
              buffer_length);
       return XStorageDownloadToMemory(buffer_ptr);
     }
     case 0x0005000A: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
+      // 534507D4 - XStorageUploadFromMemory
       // 4D5307D3, 415607F7, 584108F0
       XELOGD("XStorageEnumerate({:08X}, {:08X})", buffer_ptr, buffer_length);
       return XStorageEnumerate(buffer_ptr);
     }
     case 0x0005000B: {
-      // Fixes Xbox Live error for 43430821
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
+      // 43430821
       XELOGD("XStorageUploadFromMemory({:08X}, {:08X})", buffer_ptr,
              buffer_length);
       return XStorageUploadFromMemory(buffer_ptr);
     }
     case 0x0005000C: {
-      XELOGD("XStringVerify({:08X} {:08X})", buffer_ptr, buffer_length);
-      return XStringVerify(buffer_ptr);
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
+      // 454107F1 - After successful XOnlineGetServiceInfo
+      // 4E4D07D3 - XStorageUploadFromMemory
+      // 57520829 - XStringVerify
+      XELOGD("XLiveBaseUnk5000C({:08X} {:08X})", buffer_ptr, buffer_length);
+      return GenericMarshalled(buffer_ptr);
     }
     case 0x0005000D: {
-      // Fixes hang when leaving session for 545107D5
-      // 415607D2 says this is XStringVerify
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XStringVerify({:08X}, {:08X})", buffer_ptr, buffer_length);
       return XStringVerify(buffer_ptr);
     }
     case 0x0005000E: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XUserFindUsers({:08X}, {:08X})", buffer_ptr, buffer_length);
       return XUserFindUsers(buffer_ptr);
     }
     case 0x0005000F: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("_XAccountGetUserInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
       return XAccountGetUserInfo(buffer_ptr);
     }
     case 0x00050010: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XAccountGetUserInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
       return XAccountGetUserInfo(buffer_ptr);
     }
     case 0x00050036: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       // 534507D4
       XELOGD("XOnlineQuerySearch({:08X}, {:08X})", buffer_ptr, buffer_length);
       return XOnlineQuerySearch(buffer_ptr);
     }
     case 0x00050038: {
-      // 4D5307D3, 4D5307D1
-      XELOGD("XOnlineQuerySearch({:08X}, {:08X}) unimplemented", buffer_ptr,
-             buffer_length);
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
+      // 4D5307D3, 4D5307D1, 545407E2, 545407E3, 545407D2, 545407D3
+      XELOGD("XOnlineQuerySearch({:08X}, {:08X})", buffer_ptr, buffer_length);
       return XOnlineQuerySearch(buffer_ptr);
     }
     case 0x00050077: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XAccountGetPointsBalance({:08X}, {:08X}) Stubbed", buffer_ptr,
              buffer_length);
       return XAccountGetPointsBalance(buffer_ptr);
     }
     case 0x00050079: {
-      // Fixes Xbox Live error for 454107DB
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
+      // 454107DB
       XELOGD("XLiveBaseUnk50079({:08X}, {:08X}) unimplemented", buffer_ptr,
              buffer_length);
       return GenericMarshalled(buffer_ptr);
     }
     case 0x0005008B: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XLiveBaseUnk5008B({:08X}, {:08X}) Stubbed", buffer_ptr,
              buffer_length);
       return Unkn5008B(buffer_ptr);
     }
     case 0x0005008F: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XLiveBaseUnk5008F({:08X}, {:08X}) Stubbed", buffer_ptr,
              buffer_length);
       return Unkn5008F(buffer_ptr);
     }
     case 0x00050090: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XLiveBaseUnk50090({:08X}, {:08X}) Stubbed", buffer_ptr,
              buffer_length);
       return Unkn50090(buffer_ptr);
     }
     case 0x00050091: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XLiveBaseUnk50091({:08X}, {:08X}) Stubbed", buffer_ptr,
              buffer_length);
       return Unkn50091(buffer_ptr);
     }
     case 0x00050097: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       XELOGD("XLiveBaseUnk50097({:08X}, {:08X}) Stubbed", buffer_ptr,
              buffer_length);
       return Unkn50097(buffer_ptr);
@@ -238,8 +290,6 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
       return XPresenceUnsubscribe(buffer_length);
     }
     case 0x00058020: {
-      // 0x00058004 is called right before this.
-      // buffer_length seems to be the same ptr sent to 0x00058004.
       XELOGD("XFriendsCreateEnumerator({:08X}, {:08X})", buffer_ptr,
              buffer_length);
       return XFriendsCreateEnumerator(buffer_length);
@@ -247,9 +297,8 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
     case 0x00058023: {
       // 584107D7
       // 5841091C expects xuid_invitee
-      XELOGD(
-          "CXLiveMessaging::XMessageGameInviteGetAcceptedInfo({:08X}, {:08X})",
-          buffer_ptr, buffer_length);
+      XELOGD("XInviteGetAcceptedInfo({:08X}, {:08X})", buffer_ptr,
+             buffer_length);
       return XInviteGetAcceptedInfo(buffer_length);
     }
     case 0x00058024: {
@@ -263,10 +312,9 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
       return XOnlineGetTaskProgress(buffer_ptr);
     }
     case 0x00058035: {
-      // Fixes Xbox Live error for 513107D9
-      // Required for 534507D4
       XELOGD("XStorageBuildServerPath({:08X}, {:08X})", buffer_ptr,
              buffer_length);
+      // 4D5307EA, 4E4D07D3 - Builds clip path
       return XStorageBuildServerPath(buffer_ptr);
     }
     case 0x00058037: {
@@ -596,39 +644,167 @@ X_HRESULT XLiveBaseApp::XPresenceCreateEnumerator(uint32_t buffer_length) {
   return X_E_SUCCESS;
 }
 
+// Backwards compatible XLSP
 X_HRESULT XLiveBaseApp::XOnlineQuerySearch(uint32_t buffer_ptr) {
-  // Usually called after success returned from GetServiceInfo.
+  // Usually called after success returned from XOnlineGetServiceInfo.
 
   if (!buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XOnlineQuerySearch_Marshalled_Data* data_ptr =
-      kernel_state_->memory()
-          ->TranslateVirtual<XOnlineQuerySearch_Marshalled_Data*>(buffer_ptr);
+  XQuerySearchUnmarshaller* unmarshaller =
+      new XQuerySearchUnmarshaller(buffer_ptr);
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
+  X_HRESULT deserialize_result = unmarshaller->Deserialize();
 
-  XOnlineQuerySearch_Args* args_online_query_search =
-      kernel_state_->memory()->TranslateVirtual<XOnlineQuerySearch_Args*>(
-          internal_data_ptr->start_args_ptr);
+  if (deserialize_result) {
+    return deserialize_result;
+  }
 
-  QUERY_SEARCH_RESULT* query_search_results_ptr =
-      kernel_state_->memory()->TranslateVirtual<QUERY_SEARCH_RESULT*>(
-          internal_data_ptr->results_ptr);
+  unmarshaller->PrettyPrintAttributesSpec();
 
-  memset(query_search_results_ptr, 0, internal_data_ptr->results_size);
+  unmarshaller->ZeroResults();
 
-  XELOGI("{}: Title ID: {:08X}, Procedure Index: {}, Dataset ID: {:08X}",
-         __func__, args_online_query_search->title_id,
-         args_online_query_search->proc_index,
-         args_online_query_search->dataset_id);
+  QUERY_SEARCH_RESULT* results_ptr =
+      unmarshaller->Results<QUERY_SEARCH_RESULT>();
+
+  results_ptr->total_results = 1;
+  results_ptr->returned_results = 1;
+  results_ptr->num_result_attributes = static_cast<uint32_t>(
+      unmarshaller->Attributes().size() * results_ptr->returned_results);
+
+  X_ONLINE_QUERY_ATTRIBUTE* attributes_ptr =
+      reinterpret_cast<X_ONLINE_QUERY_ATTRIBUTE*>(results_ptr + 1);
+
+  uint32_t attributes_address = kernel_state_->memory()->HostToGuestVirtual(
+      std::to_address(attributes_ptr));
+
+  results_ptr->attributes_ptr = attributes_address;
+
+  for (uint32_t gateway_index = 0;
+       gateway_index < results_ptr->returned_results; gateway_index++) {
+    uint32_t attribute_index = static_cast<uint32_t>(
+        (gateway_index * unmarshaller->Attributes().size()));
+
+    uint8_t* binary_alloc_ptr = reinterpret_cast<uint8_t*>(
+        attributes_ptr + results_ptr->num_result_attributes);
+
+    for (auto const& attribute : unmarshaller->Attributes()) {
+      switch (attribute.type) {
+        case X_ONLINE_LSP_ATTRIBUTE_TSADDR: {
+          assert_false(attribute.length != sizeof(TSADDR));
+
+          uint32_t TSADDR_adderess =
+              kernel_state()->memory()->SystemHeapAlloc(sizeof(TSADDR));
+
+          TSADDR* TSADDR_ptr =
+              kernel_state()->memory()->TranslateVirtual<TSADDR*>(
+                  TSADDR_adderess);
+
+          TSADDR_ptr->inaOnline = ip_to_in_addr("127.0.0.1");
+          TSADDR_ptr->wPortOnline = XNET_SYSTEMLINK_PORT;
+
+          attributes_ptr[attribute_index].attribute_id =
+              X_ONLINE_LSP_ATTRIBUTE_TSADDR;
+          attributes_ptr[attribute_index].info.blob.length = sizeof(TSADDR);
+          attributes_ptr[attribute_index].info.blob.value_ptr = TSADDR_adderess;
+        } break;
+        case X_ONLINE_LSP_ATTRIBUTE_XNKID: {
+          assert_false(attribute.length != sizeof(XNKID));
+
+          uint32_t XNKID_adderess =
+              kernel_state()->memory()->SystemHeapAlloc(sizeof(XNKID));
+
+          XNKID* XNKID_ptr = kernel_state()->memory()->TranslateVirtual<XNKID*>(
+              XNKID_adderess);
+
+          xe::be<uint64_t> session_id = GenerateSessionId(XNKID_SERVER);
+
+          std::memcpy(XNKID_ptr, &session_id, sizeof(XNKID));
+
+          attributes_ptr[attribute_index].attribute_id =
+              X_ONLINE_LSP_ATTRIBUTE_XNKID;
+          attributes_ptr[attribute_index].info.blob.length = sizeof(XNKID);
+          attributes_ptr[attribute_index].info.blob.value_ptr = XNKID_adderess;
+        } break;
+        case X_ONLINE_LSP_ATTRIBUTE_KEY: {
+          assert_false(attribute.length != sizeof(XNKEY));
+
+          uint32_t XNKEY_adderess =
+              kernel_state()->memory()->SystemHeapAlloc(sizeof(XNKEY));
+
+          XNKEY* XNKEY_ptr = kernel_state()->memory()->TranslateVirtual<XNKEY*>(
+              XNKEY_adderess);
+
+          GenerateIdentityExchangeKey(XNKEY_ptr);
+
+          attributes_ptr[attribute_index].attribute_id =
+              X_ONLINE_LSP_ATTRIBUTE_KEY;
+          attributes_ptr[attribute_index].info.blob.length = sizeof(XNKEY);
+          attributes_ptr[attribute_index].info.blob.value_ptr = XNKEY_adderess;
+        } break;
+        case X_ONLINE_LSP_ATTRIBUTE_USER:
+          attributes_ptr[attribute_index].attribute_id =
+              X_ONLINE_LSP_ATTRIBUTE_USER;
+          break;
+        case X_ONLINE_LSP_ATTRIBUTE_PARAM_USER:
+          attributes_ptr[attribute_index].attribute_id =
+              X_ONLINE_LSP_ATTRIBUTE_PARAM_USER;
+          break;
+        case X_ATTRIBUTE_DATATYPE_INTEGER:
+          attributes_ptr[attribute_index].attribute_id =
+              X_ATTRIBUTE_DATATYPE_INTEGER;
+          attributes_ptr[attribute_index].info.integer.length = 0;
+          attributes_ptr[attribute_index].info.integer.value = 0;
+          break;
+        case X_ATTRIBUTE_DATATYPE_STRING: {
+          // PGR3 & PDZ use X_ATTRIBUTE_DATATYPE_STRING
+
+          // PGR3
+          std::u16string filter = u"VINCE";
+
+          uint32_t size = static_cast<uint32_t>(
+              xe::string_util::size_in_bytes(filter, true));
+
+          // LSP Filter?
+          uint32_t string_adderess =
+              kernel_state()->memory()->SystemHeapAlloc(size);
+
+          char16_t* string_ptr =
+              kernel_state()->memory()->TranslateVirtual<char16_t*>(
+                  string_adderess);
+
+          xe::string_util::copy_and_swap_truncating(string_ptr, filter.c_str(),
+                                                    filter.size() + 1);
+
+          attributes_ptr[attribute_index].attribute_id =
+              X_ATTRIBUTE_DATATYPE_STRING;
+          attributes_ptr[attribute_index].info.string.length =
+              static_cast<uint32_t>(filter.size() + 1);
+          attributes_ptr[attribute_index].info.string.value_ptr =
+              string_adderess;
+        } break;
+        case X_ATTRIBUTE_DATATYPE_BLOB:
+          attributes_ptr[attribute_index].attribute_id =
+              X_ATTRIBUTE_DATATYPE_BLOB;
+          break;
+        default:
+          assert_always();
+          break;
+      }
+
+      attribute_index++;
+    }
+  }
+
+  XELOGI("{}: Total Gateways: {}, Returned Gateways: {}, Attributes: {}",
+         __func__, results_ptr->total_results.get(),
+         results_ptr->returned_results.get(), unmarshaller->NumAttributes());
 
   return X_E_SUCCESS;
 }
 
+// Check whether XLSP services are available
 X_HRESULT XLiveBaseApp::XOnlineGetServiceInfo(uint32_t serviceid,
                                               uint32_t serviceinfo) {
   if (!XLiveAPI::IsConnectedToServer()) {
@@ -797,6 +973,29 @@ void XLiveBaseApp::UpdatePresenceXUIDs(const std::vector<uint64_t>& xuids,
   }
 }
 
+X_HRESULT XLiveBaseApp::XInviteSend(uint32_t buffer_ptr) {
+  if (!buffer_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  // Current session must have PRESENCE flag.
+
+  XInviteSendUnmarshaller* unmarshaller =
+      new XInviteSendUnmarshaller(buffer_ptr);
+
+  X_HRESULT deserialize_result = unmarshaller->Deserialize();
+
+  if (deserialize_result) {
+    return deserialize_result;
+  }
+
+  new xe::ui::HostNotificationWindow(
+      kernel_state()->emulator()->imgui_drawer(), "Invites aren't supported!",
+      xe::to_utf8(unmarshaller->DisplayString()), 0);
+
+  return X_E_SUCCESS;
+}
+
 X_HRESULT XLiveBaseApp::XInviteGetAcceptedInfo(uint32_t buffer_length) {
   Memory* memory = kernel_state_->memory();
 
@@ -890,35 +1089,21 @@ X_HRESULT XLiveBaseApp::XInviteGetAcceptedInfo(uint32_t buffer_length) {
 }
 
 X_HRESULT XLiveBaseApp::GenericMarshalled(uint32_t buffer_ptr) {
-  Generic_Marshalled_Data* data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Generic_Marshalled_Data*>(
-          buffer_ptr);
-
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
-
-  uint8_t* results_ptr = nullptr;
-
-  uint8_t* args_ptr = kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-      internal_data_ptr->start_args_ptr);
-
-  if (!data_ptr->internal_data_ptr) {
+  if (!buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  if (!internal_data_ptr->start_args_ptr) {
+  GenericUnmarshaller* unmarshaller = new GenericUnmarshaller(buffer_ptr);
+
+  uint8_t* args_ptr = unmarshaller->DeserializeReinterpret<uint8_t>();
+
+  if (!args_ptr) {
     return X_E_INVALIDARG;
   }
 
-  if (!internal_data_ptr->results_ptr) {
-    return X_E_INVALIDARG;
-  }
+  unmarshaller->ZeroResults();
 
-  results_ptr = kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-      internal_data_ptr->results_ptr);
-
-  std::fill_n(results_ptr, internal_data_ptr->results_size, 0);
+  uint8_t* results_ptr = unmarshaller->Results<uint8_t>();
 
   return X_E_SUCCESS;
 }
@@ -953,54 +1138,19 @@ X_HRESULT XLiveBaseApp::XAccountGetUserInfo(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XAccountGetUserInfo_Marshalled_Data* data_ptr =
-      kernel_state()
-          ->memory()
-          ->TranslateVirtual<XAccountGetUserInfo_Marshalled_Data*>(buffer_ptr);
+  XAccountGetUserInfoUnmarshaller* unmarshaller =
+      new XAccountGetUserInfoUnmarshaller(buffer_ptr);
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
+  X_HRESULT deserialize_result = unmarshaller->Deserialize();
 
-  uint8_t* args_stream_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-          internal_data_ptr->start_args_ptr);
+  if (deserialize_result) {
+    return deserialize_result;
+  }
 
   X_GET_USER_INFO_RESPONSE* user_info_response_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_GET_USER_INFO_RESPONSE*>(
-          internal_data_ptr->results_ptr);
+      unmarshaller->Results<X_GET_USER_INFO_RESPONSE>();
 
-  if (!data_ptr->internal_data_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  if (!internal_data_ptr->start_args_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  if (!internal_data_ptr->results_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  if (internal_data_ptr->results_size < XAccountGetUserInfoResponseSize()) {
-    return X_ONLINE_E_ACCOUNTS_USER_GET_ACCOUNT_INFO_ERROR;
-  }
-
-  memset(user_info_response_ptr, 0, internal_data_ptr->results_size);
-
-  uint32_t offset = 0;
-
-  xe::be<uint64_t> xuid = *reinterpret_cast<uint64_t*>(args_stream_ptr);
-
-  offset += sizeof(uint64_t);
-
-  xe::be<uint64_t> machine_id =
-      *reinterpret_cast<uint64_t*>(args_stream_ptr + offset);
-
-  offset += sizeof(uint64_t);
-
-  xe::be<uint32_t> title_id =
-      *reinterpret_cast<uint32_t*>(args_stream_ptr + offset);
+  unmarshaller->ZeroResults();
 
   // Example usage
   std::u16string first_name = u"First Name";
@@ -1036,89 +1186,29 @@ X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XStorageEnumerate_Marshalled_Data* data_ptr =
-      kernel_state()
-          ->memory()
-          ->TranslateVirtual<XStorageEnumerate_Marshalled_Data*>(buffer_ptr);
+  XStorageEnumerateUnmarshaller* unmarshaller =
+      new XStorageEnumerateUnmarshaller(buffer_ptr);
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
+  X_HRESULT deserialize_result = unmarshaller->Deserialize();
 
-  uint8_t* args_stream_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-          internal_data_ptr->start_args_ptr);
-
-  X_STORAGE_ENUMERATE_RESULTS* results_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_STORAGE_ENUMERATE_RESULTS*>(
-          internal_data_ptr->results_ptr);
-
-  if (!data_ptr->internal_data_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  if (!internal_data_ptr->start_args_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  if (!internal_data_ptr->results_ptr) {
-    return X_E_INVALIDARG;
+  if (deserialize_result) {
+    return deserialize_result;
   }
 
   // Fixed 415607F7 from crashing.
-  memset(results_ptr, 0, internal_data_ptr->results_size);
+  unmarshaller->ZeroResults();
 
-  uint32_t offset = 0;
+  X_STORAGE_ENUMERATE_RESULTS* results_ptr =
+      unmarshaller->Results<X_STORAGE_ENUMERATE_RESULTS>();
 
-  xe::be<uint32_t> user_index = 0;
-  memcpy(&user_index, args_stream_ptr, sizeof(uint32_t));
+  auto user_profle =
+      kernel_state()->xam_state()->GetUserProfile(unmarshaller->UserIndex());
 
-  offset += sizeof(uint32_t);
-
-  xe::be<uint32_t> server_path_len = 0;
-  memcpy(&server_path_len, args_stream_ptr + offset, sizeof(uint32_t));
-
-  offset += sizeof(uint32_t);
-
-  char16_t* arg_server_path_ptr =
-      reinterpret_cast<char16_t*>(args_stream_ptr + offset);
-
-  uint32_t server_path_size = server_path_len * sizeof(char16_t);
-
-  offset += server_path_size;
-
-  uint8_t* arg_starting_index_ptr = args_stream_ptr + offset;
-  uint32_t* starting_index_ptr =
-      reinterpret_cast<uint32_t*>(args_stream_ptr + offset);
-
-  offset += sizeof(uint32_t);
-
-  uint32_t* arg_max_results_to_return_ptr =
-      reinterpret_cast<uint32_t*>(args_stream_ptr + offset);
-
-  // Exclude null-terminator
-  server_path_len -= 1;
-
-  std::u16string server_path;
-  server_path.resize(server_path_len);
-
-  xe::copy_and_swap(server_path.data(), arg_server_path_ptr, server_path_len);
-
-  uint32_t starting_index = xe::load_and_swap<uint32_t>(arg_starting_index_ptr);
-  uint32_t max_results_to_return =
-      xe::load_and_swap<uint32_t>(arg_max_results_to_return_ptr);
-
-  if (server_path_len > X_ONLINE_MAX_PATHNAME_LENGTH) {
-    return X_E_FAIL;
-  }
-
-  auto user_profle = kernel_state()->xam_state()->GetUserProfile(user_index);
-
-  const std::string enumeration_path = xe::to_utf8(server_path);
+  const std::string enumeration_path = xe::to_utf8(unmarshaller->ServerPath());
 
   const uint32_t available_to_return_items =
       static_cast<uint32_t>(std::floor<uint32_t>(static_cast<uint32_t>(
-          (internal_data_ptr->results_size -
+          (unmarshaller->GetXLiveAsyncTask()->results_size -
            sizeof(X_STORAGE_ENUMERATE_RESULTS)) /
           (sizeof(X_STORAGE_FILE_INFO) +
            (X_ONLINE_MAX_PATHNAME_LENGTH * sizeof(char16_t))))));
@@ -1135,19 +1225,6 @@ X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr) {
       reinterpret_cast<char16_t*>(items_array_ptr + available_to_return_items);
 
   X_STATUS result = X_E_SUCCESS;
-
-  if (server_path.empty()) {
-    XELOGI("{}: Empty Server Path", __func__);
-    return X_E_INVALIDARG;
-  }
-
-  if (max_results_to_return > X_STORAGE_MAX_RESULTS_TO_RETURN) {
-    return X_E_INVALIDARG;
-  }
-
-  if (starting_index >= X_STORAGE_MAX_RESULTS_TO_RETURN) {
-    return X_E_INVALIDARG;
-  }
 
   if (!available_to_return_items) {
     return X_E_INVALIDARG;
@@ -1176,9 +1253,8 @@ X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr) {
   bool enumerated_backend = false;
 
   if (route_backend) {
-    uint32_t max_items = max_results_to_return < available_to_return_items
-                             ? max_results_to_return
-                             : available_to_return_items;
+    const uint32_t max_items = std::min<uint32_t>(
+        unmarshaller->MaxResultsToReturn(), available_to_return_items);
 
     const auto enumeration_result =
         XLiveAPI::XStorageEnumerate(enumeration_path, max_items);
@@ -1186,7 +1262,7 @@ X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr) {
     const auto& enumerated_files = enumeration_result.first;
     enumerated_backend = enumeration_result.second;
 
-    for (uint32_t item_index = starting_index;
+    for (uint32_t item_index = unmarshaller->StartingIndex();
          const auto& entry : enumerated_files->Items()) {
       std::string filename = utf8::find_name_from_path(entry.FilePath(), '/');
 
@@ -1312,7 +1388,8 @@ X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr) {
                 return entry_1->write_timestamp() > entry_2->write_timestamp();
               });
 
-    for (uint32_t item_index = starting_index; const auto entry : entries) {
+    for (uint32_t item_index = unmarshaller->StartingIndex();
+         const auto entry : entries) {
       std::string symlink_item_path =
           std::format("{}\\{}", item_parent, entry->name());
 
@@ -1371,8 +1448,8 @@ X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr) {
       "{}: Available Items Space: {}, Storage Items: {}, Start Index: {}, Max "
       "Items: {}, Server Path: {}",
       __func__, available_to_return_items,
-      results_ptr->num_items_returned.get(), starting_index,
-      max_results_to_return, final_enumeration_path);
+      results_ptr->num_items_returned.get(), unmarshaller->StartingIndex(),
+      unmarshaller->MaxResultsToReturn(), final_enumeration_path);
 
   return result;
 }
@@ -1382,89 +1459,22 @@ X_HRESULT XLiveBaseApp::XStringVerify(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XStringVerify_Marshalled_Data* data_ptr =
-      kernel_state_->memory()->TranslateVirtual<XStringVerify_Marshalled_Data*>(
-          buffer_ptr);
+  XStringVerifyUnmarshaller* unmarshaller =
+      new XStringVerifyUnmarshaller(buffer_ptr);
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
+  X_HRESULT deserialize_result = unmarshaller->Deserialize();
 
-  uint8_t* args_stream_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-          internal_data_ptr->start_args_ptr);
+  if (deserialize_result) {
+    return deserialize_result;
+  }
+
+  unmarshaller->ZeroResults();
 
   STRING_VERIFY_RESPONSE* responses_ptr =
-      kernel_state_->memory()->TranslateVirtual<STRING_VERIFY_RESPONSE*>(
-          internal_data_ptr->results_ptr);
+      unmarshaller->Results<STRING_VERIFY_RESPONSE>();
 
-  if (!data_ptr->internal_data_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  if (!internal_data_ptr->start_args_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  if (!internal_data_ptr->results_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  memset(responses_ptr, 0, internal_data_ptr->results_size);
-
-  uint16_t* locale_size_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint16_t*>(
-          data_ptr->locale_size_ptr);
-  uint16_t* num_strings_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint16_t*>(
-          data_ptr->num_strings_ptr);
-  uint16_t* last_entry_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint16_t*>(
-          data_ptr->last_entry_ptr);
-
-  uint16_t locale_size = *locale_size_ptr;
-  uint16_t num_strings = *num_strings_ptr;
-
-  if (locale_size > X_ONLINE_MAX_XSTRING_VERIFY_LOCALE) {
-    return X_E_INVALIDARG;
-  }
-
-  if (num_strings > X_ONLINE_MAX_XSTRING_VERIFY_STRING_DATA) {
-    return X_E_INVALIDARG;
-  }
-
-  xe::be<uint32_t> title_id = *reinterpret_cast<uint32_t*>(args_stream_ptr);
-
-  xe::be<uint32_t> flags =
-      *reinterpret_cast<uint32_t*>(args_stream_ptr + sizeof(uint32_t));
-
-  char* locale_string_ptr = kernel_state_->memory()->TranslateVirtual<char*>(
-      data_ptr->num_strings_ptr + sizeof(uint16_t));
-
-  std::string locale = std::string(locale_string_ptr, locale_size);
-
-  char* string_data = locale_string_ptr + locale_size;
-
-  std::vector<std::string> strings_to_verify;
-
-  uint32_t string_data_offset = 0;
-
-  for (uint32_t i = 0; i < num_strings; i++) {
-    uint16_t size = 0;
-    memcpy(&size, string_data + string_data_offset, sizeof(uint16_t));
-
-    string_data_offset += sizeof(uint16_t);
-
-    // Unicode is represented as UTF-8 array
-    char* string_data_ptr = string_data + string_data_offset;
-
-    std::string input_string = std::string(string_data_ptr, size);
-
-    string_data_offset += size;
-
-    strings_to_verify.push_back(input_string);
-
-    XELOGI("{}: {}", __func__, input_string);
+  for (auto const& string_to_verify : unmarshaller->StringToVerify()) {
+    XELOGI("{}: {}", __func__, string_to_verify);
   }
 
   uint32_t response_result_address =
@@ -1475,11 +1485,11 @@ X_HRESULT XLiveBaseApp::XStringVerify(uint32_t buffer_ptr) {
       kernel_state_->memory()->TranslateVirtual<HRESULT*>(
           response_result_address);
 
-  for (uint32_t i = 0; i < num_strings; i++) {
+  for (uint32_t i = 0; i < unmarshaller->NumStrings(); i++) {
     response_results_ptr[i] = X_E_SUCCESS;
   }
 
-  responses_ptr->num_strings = num_strings;
+  responses_ptr->num_strings = unmarshaller->NumStrings();
   responses_ptr->string_result_ptr = response_result_address;
 
   return X_E_SUCCESS;
@@ -1490,65 +1500,18 @@ X_HRESULT XLiveBaseApp::XStorageDelete(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XStorageDelete_Marshalled_Data* data_ptr =
-      kernel_state_->memory()
-          ->TranslateVirtual<XStorageDelete_Marshalled_Data*>(buffer_ptr);
+  XStorageDeleteUnmarshaller* unmarshaller =
+      new XStorageDeleteUnmarshaller(buffer_ptr);
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
+  X_HRESULT deserialize_result = unmarshaller->Deserialize();
 
-  uint8_t* args_stream_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-          internal_data_ptr->start_args_ptr);
-
-  if (!data_ptr->internal_data_ptr) {
-    return X_E_INVALIDARG;
+  if (deserialize_result) {
+    return deserialize_result;
   }
 
-  if (!internal_data_ptr->start_args_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  uint32_t offset = 0;
-
-  xe::be<uint32_t> user_index = 0;
-  memcpy(&user_index, args_stream_ptr, sizeof(uint32_t));
-
-  offset += sizeof(uint32_t);
-
-  xe::be<uint32_t> server_path_len = 0;
-  memcpy(&server_path_len, args_stream_ptr + offset, sizeof(uint32_t));
-
-  offset += sizeof(uint32_t);
-
-  char16_t* arg_server_path_ptr =
-      reinterpret_cast<char16_t*>(args_stream_ptr + offset);
-
-  uint32_t server_path_size = server_path_len * sizeof(char16_t);
-
-  offset += server_path_size;
-
-  const auto user_profile =
-      kernel_state()->xam_state()->GetUserProfile(user_index);
-
-  // Exclude null-terminator
-  server_path_len -= 1;
-
-  std::u16string server_path;
-  server_path.resize(server_path_len, 0);
-
-  xe::copy_and_swap(server_path.data(), arg_server_path_ptr,
-                    static_cast<uint32_t>(server_path_len));
-
-  std::string item_path = xe::to_utf8(server_path);
+  std::string item_path = xe::to_utf8(unmarshaller->ServerPath());
 
   X_STATUS result = X_E_FAIL;
-
-  if (item_path.empty()) {
-    XELOGI("{}: Empty Server Path", __func__);
-    return X_ONLINE_E_STORAGE_INVALID_STORAGE_PATH;
-  }
 
   X_STORAGE_FACILITY facility_type =
       GetStorageFacilityTypeFromServerPath(item_path);
@@ -1594,82 +1557,29 @@ X_HRESULT XLiveBaseApp::XStorageDownloadToMemory(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XStorageDownloadToMemory_Marshalled_Data* data_ptr =
-      kernel_state_->memory()
-          ->TranslateVirtual<XStorageDownloadToMemory_Marshalled_Data*>(
-              buffer_ptr);
+  XStorageDownloadToMemoryUnmarshaller* unmarshaller =
+      new XStorageDownloadToMemoryUnmarshaller(buffer_ptr);
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
+  X_HRESULT deserialize_result = unmarshaller->Deserialize();
 
-  uint8_t* args_stream_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-          internal_data_ptr->start_args_ptr);
-
-  X_STORAGE_DOWNLOAD_TO_MEMORY_RESULTS* download_results_ptr =
-      kernel_state_->memory()
-          ->TranslateVirtual<X_STORAGE_DOWNLOAD_TO_MEMORY_RESULTS*>(
-              internal_data_ptr->results_ptr);
-
-  if (!data_ptr->internal_data_ptr) {
-    return X_E_INVALIDARG;
+  if (deserialize_result) {
+    return deserialize_result;
   }
-
-  if (!internal_data_ptr->start_args_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  if (!internal_data_ptr->results_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  // Fixed 415607DD & 41560834
-  memset(download_results_ptr, 0, internal_data_ptr->results_size);
-
-  uint32_t offset = 0;
-
-  xe::be<uint32_t> user_index = 0;
-  memcpy(&user_index, args_stream_ptr, sizeof(uint32_t));
-
-  offset += sizeof(uint32_t);
-
-  xe::be<uint32_t> server_path_len = 0;
-  memcpy(&server_path_len, args_stream_ptr + offset, sizeof(uint32_t));
-
-  offset += sizeof(uint32_t);
-
-  char16_t* arg_server_path_ptr =
-      reinterpret_cast<char16_t*>(args_stream_ptr + offset);
-
-  uint32_t server_path_size = server_path_len * sizeof(char16_t);
-
-  offset += server_path_size;
-
-  xe::be<uint32_t> buffer_size = 0;
-  memcpy(&buffer_size, args_stream_ptr + offset, sizeof(uint32_t));
-
-  offset += sizeof(uint32_t);
-
-  xe::be<uint32_t> download_buffer_address = 0;
-  memcpy(&download_buffer_address, args_stream_ptr + offset, sizeof(uint32_t));
-
-  if (!download_buffer_address) {
-    return X_E_INVALIDARG;
-  }
-
-  uint8_t* download_buffer_ptr =
-      kernel_state()->memory()->TranslateVirtual<uint8_t*>(
-          download_buffer_address);
 
   // 41560845 - Access Violation
-  // std::fill_n(download_buffer_ptr, buffer_size, 0);
+  // Unmarshaller->ZeroResults();
 
-  std::span<uint8_t> download_buffer =
-      std::span<uint8_t>(download_buffer_ptr, buffer_size);
+  X_STORAGE_DOWNLOAD_TO_MEMORY_RESULTS* download_results_ptr =
+      unmarshaller->Results<X_STORAGE_DOWNLOAD_TO_MEMORY_RESULTS>();
+
+  // Zero Results Struct
+  std::memset(download_results_ptr, 0,
+              sizeof(X_STORAGE_DOWNLOAD_TO_MEMORY_RESULTS));
+
+  std::span<uint8_t> download_buffer = unmarshaller->GetDownloadBuffer();
 
   const auto user_profile =
-      kernel_state()->xam_state()->GetUserProfile(user_index);
+      kernel_state()->xam_state()->GetUserProfile(unmarshaller->UserIndex());
 
   uint64_t xuid_owner = 0;
 
@@ -1677,22 +1587,9 @@ X_HRESULT XLiveBaseApp::XStorageDownloadToMemory(uint32_t buffer_ptr) {
     xuid_owner = user_profile->GetOnlineXUID();
   }
 
-  // Exclude null-terminator
-  server_path_len -= 1;
-
-  std::u16string server_path;
-  server_path.resize(server_path_len, 0);
-
-  xe::copy_and_swap(server_path.data(), arg_server_path_ptr,
-                    static_cast<uint32_t>(server_path_len));
-
-  std::string item_to_download = xe::to_utf8(server_path);
+  std::string item_to_download = xe::to_utf8(unmarshaller->ServerPath());
 
   X_STATUS result = X_ONLINE_E_STORAGE_FILE_NOT_FOUND;
-
-  if (server_path.empty()) {
-    return X_ONLINE_E_STORAGE_INVALID_STORAGE_PATH;
-  }
 
   X_STORAGE_FACILITY facility_type =
       GetStorageFacilityTypeFromServerPath(item_to_download);
@@ -1749,9 +1646,9 @@ X_HRESULT XLiveBaseApp::XStorageDownloadToMemory(uint32_t buffer_ptr) {
       output_file->Destroy();
 
       if (!open_result) {
-        if (bytes_read > buffer_size) {
+        if (bytes_read > unmarshaller->BufferSize()) {
           XELOGI("{}: Provided file size {}b is larger than expected {}b",
-                 __func__, bytes_read, buffer_size.get());
+                 __func__, bytes_read, unmarshaller->BufferSize());
           return X_E_INSUFFICIENT_BUFFER;
         }
 
@@ -1774,8 +1671,8 @@ X_HRESULT XLiveBaseApp::XStorageDownloadToMemory(uint32_t buffer_ptr) {
   }
 
   XELOGI("{}: Downloaded Bytes: {}b, Buffer Size: {}b, Server Path: {}",
-         __func__, download_results_ptr->bytes_total.get(), buffer_size.get(),
-         item_to_download);
+         __func__, download_results_ptr->bytes_total.get(),
+         unmarshaller->BufferSize(), item_to_download);
 
   return result;
 }
@@ -1785,78 +1682,18 @@ X_HRESULT XLiveBaseApp::XStorageUploadFromMemory(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XStorageUploadFromMemory_Marshalled_Data* data_ptr =
-      kernel_state_->memory()
-          ->TranslateVirtual<XStorageUploadFromMemory_Marshalled_Data*>(
-              buffer_ptr);
+  XStorageUploadToMemoryUnmarshaller* unmarshaller =
+      new XStorageUploadToMemoryUnmarshaller(buffer_ptr);
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
+  X_HRESULT deserialize_result = unmarshaller->Deserialize();
 
-  uint8_t* args_stream_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-          internal_data_ptr->start_args_ptr);
-
-  if (!data_ptr->internal_data_ptr) {
-    return X_E_INVALIDARG;
+  if (deserialize_result) {
+    return deserialize_result;
   }
 
-  if (!internal_data_ptr->start_args_ptr) {
-    return X_E_INVALIDARG;
-  }
+  std::span<uint8_t> upload_buffer = unmarshaller->GetUploadBuffer();
 
-  uint32_t offset = 0;
-
-  xe::be<uint32_t> user_index = 0;
-  memcpy(&user_index, args_stream_ptr, sizeof(uint32_t));
-
-  offset += sizeof(uint32_t);
-
-  xe::be<uint32_t> server_path_len = 0;
-  memcpy(&server_path_len, args_stream_ptr + offset, sizeof(uint32_t));
-
-  offset += sizeof(uint32_t);
-
-  char16_t* arg_server_path_ptr =
-      reinterpret_cast<char16_t*>(args_stream_ptr + offset);
-
-  uint32_t server_path_size = server_path_len * sizeof(char16_t);
-
-  offset += server_path_size;
-
-  xe::be<uint32_t> buffer_size = 0;
-  memcpy(&buffer_size, args_stream_ptr + offset, sizeof(uint32_t));
-
-  offset += sizeof(uint32_t);
-
-  xe::be<uint32_t> upload_buffer_address = 0;
-  memcpy(&upload_buffer_address, args_stream_ptr + offset, sizeof(uint32_t));
-
-  if (!upload_buffer_address) {
-    return X_E_INVALIDARG;
-  }
-
-  if (buffer_size > kTMSClipMaxSize) {
-    return X_ONLINE_E_STORAGE_FILE_IS_TOO_BIG;
-  }
-
-  uint8_t* upload_buffer_ptr =
-      kernel_state()->memory()->TranslateVirtual<uint8_t*>(
-          upload_buffer_address);
-
-  std::span<uint8_t> upload_buffer =
-      std::span<uint8_t>(upload_buffer_ptr, buffer_size);
-
-  // Exclude null-terminator
-  server_path_len -= 1;
-
-  std::u16string server_path;
-  server_path.resize(server_path_len);
-
-  xe::copy_and_swap(server_path.data(), arg_server_path_ptr, server_path_len);
-
-  std::string upload_file_path = xe::to_utf8(server_path);
+  std::string upload_file_path = xe::to_utf8(unmarshaller->ServerPath());
   std::string filename = utf8::find_name_from_path(upload_file_path, '/');
 
   X_STATUS result = X_E_FAIL;
@@ -1934,7 +1771,7 @@ X_HRESULT XLiveBaseApp::XStorageUploadFromMemory(uint32_t buffer_ptr) {
       break;
   }
 
-  XELOGI("{}: Size: {}b, Path: {}", __func__, buffer_size.get(),
+  XELOGI("{}: Size: {}b, Path: {}", __func__, unmarshaller->BufferSize(),
          upload_file_path);
 
   return result;
@@ -1954,6 +1791,11 @@ X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
   }
 
   if (!args->server_path_length_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  if (args->user_index >= XUserMaxUserCount &&
+      args->user_index != XUserIndexNone) {
     return X_E_INVALIDARG;
   }
 
@@ -2223,80 +2065,33 @@ X_HRESULT XLiveBaseApp::XUserFindUsers(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XUserFindUsers_Marshalled_Data* data_ptr =
-      kernel_state_->memory()
-          ->TranslateVirtual<XUserFindUsers_Marshalled_Data*>(buffer_ptr);
+  XUserFindUsersUnmarshaller* unmarshaller =
+      new XUserFindUsersUnmarshaller(buffer_ptr);
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
+  X_HRESULT deserialize_result = unmarshaller->Deserialize();
 
-  FIND_USERS_RESPONSE* results_ptr =
-      kernel_state_->memory()->TranslateVirtual<FIND_USERS_RESPONSE*>(
-          internal_data_ptr->results_ptr);
-
-  if (!data_ptr->internal_data_ptr) {
-    return X_E_INVALIDARG;
+  if (deserialize_result) {
+    return deserialize_result;
   }
-
-  if (!internal_data_ptr->start_args_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  if (!internal_data_ptr->results_ptr) {
-    return X_E_INVALIDARG;
-  }
-
-  uint8_t* args_stream_ptr =
-      kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-          internal_data_ptr->start_args_ptr);
 
   // Fixed 58410B5D
-  memset(results_ptr, 0, internal_data_ptr->results_size);
+  unmarshaller->ZeroResults();
 
-  uint32_t offset = 0;
-
-  // 1065
-  uint32_t value_const = *reinterpret_cast<uint32_t*>(args_stream_ptr);
-
-  offset += sizeof(uint32_t);
-
-  // Data from 58017
-  uint64_t unkn_value = *reinterpret_cast<uint64_t*>(args_stream_ptr + offset);
-
-  offset += sizeof(uint64_t);
-
-  // XnpLogonGetStatus
-  SGADDR* security_gateway =
-      reinterpret_cast<SGADDR*>(args_stream_ptr + offset);
-
-  offset += sizeof(SGADDR);
-
-  uint64_t xuid_issuer = *reinterpret_cast<uint64_t*>(args_stream_ptr + offset);
-
-  offset += sizeof(uint64_t);
-
-  uint32_t num_users = *reinterpret_cast<uint32_t*>(args_stream_ptr + offset);
-
-  offset += sizeof(uint32_t);
-
-  FIND_USER_INFO* users_ptr =
-      reinterpret_cast<FIND_USER_INFO*>(args_stream_ptr + offset);
+  FIND_USERS_RESPONSE* results_ptr =
+      unmarshaller->Results<FIND_USERS_RESPONSE>();
 
   std::vector<FIND_USER_INFO> find_users = {};
   std::vector<FIND_USER_INFO> resolved_users = {};
 
-  for (uint32_t i = 0; i < num_users; i++) {
-    FIND_USER_INFO user = users_ptr[i];
-
-    const uint64_t xuid = xe::byte_swap(users_ptr[i].xuid);
+  for (auto const& user : unmarshaller->Users()) {
+    const uint64_t xuid = xe::byte_swap(user.xuid);
 
     const auto user_profile =
         kernel_state()->xam_state()->GetUserProfileLive(xuid);
 
     // Only lookup non-local users
     if (user_profile) {
-      FIND_USER_INFO local_user = users_ptr[i];
+      FIND_USER_INFO local_user = user;
 
       local_user.xuid = xuid;
       strcpy(local_user.gamertag, user_profile->name().c_str());
@@ -2314,8 +2109,8 @@ X_HRESULT XLiveBaseApp::XUserFindUsers(uint32_t buffer_ptr) {
                           resolved.end());
   }
 
-  uint32_t results_size =
-      sizeof(FIND_USERS_RESPONSE) + (num_users * sizeof(FIND_USER_INFO));
+  uint32_t results_size = sizeof(FIND_USERS_RESPONSE) +
+                          (unmarshaller->NumUsers() * sizeof(FIND_USER_INFO));
 
   uint32_t users_address = kernel_state()->memory()->HostToGuestVirtual(
       std::to_address(results_ptr + 1));
@@ -2429,24 +2224,20 @@ X_HRESULT XLiveBaseApp::Unkn5008C(uint32_t buffer_ptr) {
   // Called on startup of blades dashboard v1888 to v2858
   // Address: 92433DA8
 
-  Generic_Marshalled_Data* data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Generic_Marshalled_Data*>(
-          buffer_ptr);
-
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
-
-  uint8_t* results_ptr = kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-      internal_data_ptr->results_ptr);
+  GenericUnmarshaller* unmarshaller = new GenericUnmarshaller(buffer_ptr);
 
   // 5 Arguments
   X_DATA_ARGS_5008C* args_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_DATA_ARGS_5008C*>(
-          internal_data_ptr->start_args_ptr);
+      unmarshaller->DeserializeReinterpret<X_DATA_ARGS_5008C>();
+
+  if (!args_ptr) {
+    return X_E_INVALIDARG;
+  }
 
   // Crashes if buffer filled with 0xFF
-  memset(results_ptr, 0, internal_data_ptr->results_size);
+  unmarshaller->ZeroResults();
+
+  uint8_t* results_ptr = unmarshaller->Results<uint8_t>();
 
   return X_E_SUCCESS;
 }
@@ -2459,24 +2250,24 @@ X_HRESULT XLiveBaseApp::XAccountGetPointsBalance(uint32_t buffer_ptr) {
   // More Videos and Downloads
   // Address: 92433368
 
-  Generic_Marshalled_Data* data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Generic_Marshalled_Data*>(
-          buffer_ptr);
+  if (!buffer_ptr) {
+    return X_E_INVALIDARG;
+  }
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
-
-  X_GET_POINTS_BALANCE_RESPONSE* results_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_GET_POINTS_BALANCE_RESPONSE*>(
-          internal_data_ptr->results_ptr);
+  GenericUnmarshaller* unmarshaller = new GenericUnmarshaller(buffer_ptr);
 
   // 2 Arguments
   X_DATA_ARGS_50077* args_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_DATA_ARGS_50077*>(
-          internal_data_ptr->start_args_ptr);
+      unmarshaller->DeserializeReinterpret<X_DATA_ARGS_50077>();
 
-  memset(results_ptr, 0, internal_data_ptr->results_size);
+  if (!args_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  unmarshaller->ZeroResults();
+
+  X_GET_POINTS_BALANCE_RESPONSE* results_ptr =
+      unmarshaller->Results<X_GET_POINTS_BALANCE_RESPONSE>();
 
   results_ptr->balance = 1000000000;
   results_ptr->dmp_account_status = DMP_STATUS_TYPE::DMP_STATUS_ACTIVE;
@@ -2492,25 +2283,24 @@ X_HRESULT XLiveBaseApp::Unkn5008B(uint32_t buffer_ptr) {
   // Fixes accessing marketplace Featured Downloads.
   // Address: 92433BB0
 
-  Generic_Marshalled_Data* data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Generic_Marshalled_Data*>(
-          buffer_ptr);
+  if (!buffer_ptr) {
+    return X_E_INVALIDARG;
+  }
 
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
-
-  X_GET_FEATURED_DOWNLOADS_RESPONSE* results_ptr =
-      kernel_state_->memory()
-          ->TranslateVirtual<X_GET_FEATURED_DOWNLOADS_RESPONSE*>(
-              internal_data_ptr->results_ptr);
+  GenericUnmarshaller* unmarshaller = new GenericUnmarshaller(buffer_ptr);
 
   // 5 Arguments
   X_DATA_ARGS_5008B* args_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_DATA_ARGS_5008B*>(
-          internal_data_ptr->start_args_ptr);
+      unmarshaller->DeserializeReinterpret<X_DATA_ARGS_5008B>();
 
-  memset(results_ptr, 0, internal_data_ptr->results_size);
+  if (!args_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  unmarshaller->ZeroResults();
+
+  X_GET_FEATURED_DOWNLOADS_RESPONSE* results_ptr =
+      unmarshaller->Results<X_GET_FEATURED_DOWNLOADS_RESPONSE>();
 
   results_ptr->entries = 5;
   results_ptr->flags = 0xFFFFFFFF;
@@ -2526,23 +2316,19 @@ X_HRESULT XLiveBaseApp::Unkn5008F(uint32_t buffer_ptr) {
   // More Videos and Downloads
   // Address: 92433FA8
 
-  Generic_Marshalled_Data* data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Generic_Marshalled_Data*>(
-          buffer_ptr);
-
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
-
-  uint8_t* results_ptr = kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-      internal_data_ptr->results_ptr);
+  GenericUnmarshaller* unmarshaller = new GenericUnmarshaller(buffer_ptr);
 
   // 12 Arguments
   X_DATA_ARGS_5008F* args_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_DATA_ARGS_5008F*>(
-          internal_data_ptr->start_args_ptr);
+      unmarshaller->DeserializeReinterpret<X_DATA_ARGS_5008F>();
 
-  memset(results_ptr, 0, internal_data_ptr->results_size);
+  if (!args_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  unmarshaller->ZeroResults();
+
+  uint8_t* results_ptr = unmarshaller->Results<uint8_t>();
 
   return X_E_SUCCESS;
 }
@@ -2554,23 +2340,19 @@ X_HRESULT XLiveBaseApp::Unkn50090(uint32_t buffer_ptr) {
   // sub menu.
   // Address: 92434218
 
-  Generic_Marshalled_Data* data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Generic_Marshalled_Data*>(
-          buffer_ptr);
-
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
-
-  uint8_t* results_ptr = kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-      internal_data_ptr->results_ptr);
+  GenericUnmarshaller* unmarshaller = new GenericUnmarshaller(buffer_ptr);
 
   // 9 Arguments
   X_DATA_ARGS_50090* args_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_DATA_ARGS_50090*>(
-          internal_data_ptr->start_args_ptr);
+      unmarshaller->DeserializeReinterpret<X_DATA_ARGS_50090>();
 
-  memset(results_ptr, 0, internal_data_ptr->results_size);
+  if (!args_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  unmarshaller->ZeroResults();
+
+  uint8_t* results_ptr = unmarshaller->Results<uint8_t>();
 
   return X_E_SUCCESS;
 }
@@ -2581,23 +2363,19 @@ X_HRESULT XLiveBaseApp::Unkn50091(uint32_t buffer_ptr) {
   // Fixes accessing marketplace Game Downloads.
   // Address: 92434468
 
-  Generic_Marshalled_Data* data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Generic_Marshalled_Data*>(
-          buffer_ptr);
-
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
-
-  uint8_t* results_ptr = kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-      internal_data_ptr->results_ptr);
+  GenericUnmarshaller* unmarshaller = new GenericUnmarshaller(buffer_ptr);
 
   // 10 Arguments
   X_DATA_ARGS_50091* args_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_DATA_ARGS_50091*>(
-          internal_data_ptr->start_args_ptr);
+      unmarshaller->DeserializeReinterpret<X_DATA_ARGS_50091>();
 
-  memset(results_ptr, 0, internal_data_ptr->results_size);
+  if (!args_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  unmarshaller->ZeroResults();
+
+  uint8_t* results_ptr = unmarshaller->Results<uint8_t>();
 
   return X_E_SUCCESS;
 }
@@ -2608,23 +2386,19 @@ X_HRESULT XLiveBaseApp::Unkn50097(uint32_t buffer_ptr) {
   // Fixes accessing marketplace Memberships.
   // Address: 924346C0
 
-  Generic_Marshalled_Data* data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Generic_Marshalled_Data*>(
-          buffer_ptr);
-
-  Internal_Marshalled_Data* internal_data_ptr =
-      kernel_state_->memory()->TranslateVirtual<Internal_Marshalled_Data*>(
-          data_ptr->internal_data_ptr);
-
-  uint8_t* results_ptr = kernel_state_->memory()->TranslateVirtual<uint8_t*>(
-      internal_data_ptr->results_ptr);
+  GenericUnmarshaller* unmarshaller = new GenericUnmarshaller(buffer_ptr);
 
   // 13 Arguments
   X_DATA_ARGS_50097* args_ptr =
-      kernel_state_->memory()->TranslateVirtual<X_DATA_ARGS_50097*>(
-          internal_data_ptr->start_args_ptr);
+      unmarshaller->DeserializeReinterpret<X_DATA_ARGS_50097>();
 
-  memset(results_ptr, 0, internal_data_ptr->results_size);
+  if (!args_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  unmarshaller->ZeroResults();
+
+  uint8_t* results_ptr = unmarshaller->Results<uint8_t>();
 
   return X_E_SUCCESS;
 }
