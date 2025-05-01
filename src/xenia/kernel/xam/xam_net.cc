@@ -735,6 +735,32 @@ dword_result_t NetDll_XNetInAddrToServer_entry(dword_t caller,
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetInAddrToServer, kNetworking, kSketchy);
 
+dword_result_t NetDll_XNetTsAddrToInAddr_entry(dword_t caller,
+                                               pointer_t<TSADDR> tsaddr_ptr,
+                                               dword_t service_id,
+                                               pointer_t<XNKID> xnkid_ptr,
+                                               pointer_t<in_addr> ina_ptr) {
+  XELOGI("XNetTsAddrToInAddr");
+
+  if (ina_ptr) {
+    ina_ptr->S_un.S_addr = 0;
+  }
+
+  if (!tsaddr_ptr || !service_id) {
+    return static_cast<uint32_t>(X_WSAError::X_WSAEINVAL);
+  }
+
+  *ina_ptr = tsaddr_ptr->inaOnline;
+
+  IsValidXNKID(xnkid_ptr->as_uintBE64());
+
+  XELOGI("Server IP: {}, Service ID: {:08X}", ip_to_string(*ina_ptr),
+         static_cast<uint32_t>(service_id));
+
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(NetDll_XNetTsAddrToInAddr, kNetworking, kSketchy);
+
 dword_result_t NetDll_XNetInAddrToString_entry(dword_t caller, dword_t ina,
                                                lpstring_t string_out,
                                                dword_t string_size) {
@@ -1989,6 +2015,11 @@ dword_result_t NetDll_XNetRegisterKey_entry(dword_t caller,
   if (IsOnlinePeer(session_key->as_uintBE64())) {
     XELOGI("XNetRegisterKey: Xbox Live");
     EXPLICIT_XBOXLIVE_KEY = true;
+    return 0;
+  }
+
+  if (IsServer(session_key->as_uintBE64())) {
+    XELOGI("XNetRegisterKey: Server");
     return 0;
   }
 
