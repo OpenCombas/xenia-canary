@@ -54,7 +54,7 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
       assert_true(!buffer_length || buffer_length == 4);
       XELOGD("XLiveBaseGetNatType({:08X})", buffer_ptr);
       xe::store_and_swap<uint32_t>(buffer + 0, 1);  // XONLINE_NAT_OPEN
-      return X_E_SUCCESS;
+      return X_E_FAIL;
     }
     case 0x00058007: {
       // Occurs if title calls XOnlineGetServiceInfo, expects dwServiceId
