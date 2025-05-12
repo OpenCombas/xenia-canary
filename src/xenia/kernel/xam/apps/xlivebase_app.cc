@@ -617,7 +617,26 @@ X_HRESULT XLiveBaseApp::XOnlineQuerySearch(uint32_t buffer_ptr) {
       kernel_state_->memory()->TranslateVirtual<QUERY_SEARCH_RESULT*>(
           internal_data_ptr->results_ptr);
 
-  memset(query_search_results_ptr, 0, internal_data_ptr->results_size);
+  query_search_results_ptr->returned_results = 1;
+  query_search_results_ptr->num_result_attributes = 3;
+
+  // Set attribute results
+  X_ONLINE_SERVICE_INFO service_info = {};
+  HTTP_STATUS_CODE status = XLiveAPI::GetServiceInfoById(
+      args_online_query_search->title_id, &service_info);
+  if (status != HTTP_STATUS_CODE::HTTP_OK) {
+    return X_ONLINE_E_LOGON_SERVICE_NOT_REQUESTED;
+  }
+
+  query_search_results_ptr->attributes.lsp_attr_tsaddr.ina = service_info.ip;
+  query_search_results_ptr->attributes.lsp_attr_tsaddr.inaOnline =
+      service_info.ip;
+  query_search_results_ptr->attributes.lsp_attr_tsaddr.wPortOnline =
+      service_info.port;
+  // memcpy(lsp_attributes.lsp_attr_tsaddr.abEnet, 0,
+  //       sizeof(MacAddress));
+  // lsp_attributes.lsp_attr_xnkid.ab = 0;
+  // lsp_attributes.lsp_attr_unkn = 0;
 
   XELOGI("{}: Title ID: {:08X}, Procedure Index: {}, Dataset ID: {:08X}",
          __func__, args_online_query_search->title_id,

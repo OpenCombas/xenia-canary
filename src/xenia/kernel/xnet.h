@@ -641,6 +641,12 @@ struct X_ONLINE_QUERY_ATTRIBUTE_SPEC {
   xe::be<uint32_t> length;
 };
 
+union X_ONLINE_QUERY_LSP_ATTRIBUTES {
+  XNADDR lsp_attr_tsaddr;
+  XNKID lsp_attr_xnkid;
+  uint16_t lsp_attr_unkn;
+};
+
 struct QUERY_SEARCH_RESULT {
   xe::be<uint32_t> total_results;
   xe::be<uint32_t> returned_results;
