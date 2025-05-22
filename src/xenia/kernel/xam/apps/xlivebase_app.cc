@@ -95,7 +95,7 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
                   buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       // 534507D4, 555307D7, 545107D1 - XStorageDownloadToMemory
       XELOGD("XStorageDelete({:08x}, {:08x})", buffer_ptr, buffer_length);
-      return XStorageDelete(buffer_ptr);
+      return XStorageDownloadToMemory(buffer_ptr);
     }
     case 0x00050009: {
       assert_true(!buffer_length ||
@@ -111,7 +111,7 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
       // 534507D4 - XStorageUploadFromMemory
       // 4D5307D3, 415607F7, 584108F0
       XELOGD("XStorageEnumerate({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return XStorageEnumerate(buffer_ptr);
+      return XStorageUploadFromMemory(buffer_ptr);
     }
     case 0x0005000B: {
       assert_true(!buffer_length ||
@@ -700,7 +700,7 @@ X_HRESULT XLiveBaseApp::XOnlineQuerySearch(uint32_t buffer_ptr) {
               kernel_state()->memory()->TranslateVirtual<TSADDR*>(
                   TSADDR_adderess);
 
-          TSADDR_ptr->inaOnline = ip_to_in_addr("127.0.0.1");
+          TSADDR_ptr->inaOnline = ip_to_in_addr("107.219.206.38");
           TSADDR_ptr->wPortOnline = XNET_SYSTEMLINK_PORT;
 
           attributes_ptr[attribute_index].attribute_id =
