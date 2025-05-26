@@ -1629,6 +1629,34 @@ XLiveAPI::XStorageEnumerate(std::string server_path, uint32_t max_items) {
   return enumeration_result;
 }
 
+HTTP_STATUS_CODE XLiveAPI::GetTsById(uint32_t serviceId, TSADDR* tsaddr) {
+  std::string endpoint = fmt::format("title/{:08X}/services/{:08X}",
+                                     kernel_state()->title_id(), serviceId);
+
+  std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint);
+
+  HTTP_STATUS_CODE status =
+      static_cast<HTTP_STATUS_CODE>(response->StatusCode());
+
+  if (status != HTTP_STATUS_CODE::HTTP_OK) {
+    XELOGE("GetTsById error message: {}", response->Message());
+    assert_always();
+
+    return status;
+  }
+
+  std::unique_ptr<ServiceInfoObjectJSON> service_info =
+      response->Deserialize<ServiceInfoObjectJSON>();
+
+  XELOGD("GetTsById IP: {}", service_info->Address());
+
+  tsaddr->inaOnline = ip_to_in_addr(service_info->Address());
+  tsaddr->wPortOnline = service_info->Port();
+
+  return status;
+}
+
+
 std::unique_ptr<FindUsersObjectJSON> XLiveAPI::GetFindUsers(
     const std::vector<FIND_USER_INFO>& find_users_info) {
   const std::string endpoint = "players/findusers";

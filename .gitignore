@@ -107,4 +107,5 @@ node_modules/.bin/
 /cache1
 /cache0
 /devkit
+/xstorage
 recent.toml

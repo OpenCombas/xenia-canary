@@ -692,15 +692,19 @@ X_HRESULT XLiveBaseApp::XOnlineQuerySearch(uint32_t buffer_ptr) {
       switch (attribute.type) {
         case X_ONLINE_LSP_ATTRIBUTE_TSADDR: {
           assert_false(attribute.length != sizeof(TSADDR));
-
           uint32_t TSADDR_adderess =
               kernel_state()->memory()->SystemHeapAlloc(sizeof(TSADDR));
 
           TSADDR* TSADDR_ptr =
               kernel_state()->memory()->TranslateVirtual<TSADDR*>(
                   TSADDR_adderess);
-          TSADDR_ptr->inaOnline = ip_to_in_addr("26.23.222.2");
-          TSADDR_ptr->wPortOnline = XNET_SYSTEMLINK_PORT;
+
+          HTTP_STATUS_CODE status =
+              XLiveAPI::GetTsById(unmarshaller->TitleID(), TSADDR_ptr);
+
+          if (status != HTTP_STATUS_CODE::HTTP_OK) {
+            return X_ONLINE_E_LOGON_SERVICE_NOT_REQUESTED;
+          }
 
           attributes_ptr[attribute_index].attribute_id =
               X_ONLINE_LSP_ATTRIBUTE_TSADDR;
