@@ -699,8 +699,7 @@ X_HRESULT XLiveBaseApp::XOnlineQuerySearch(uint32_t buffer_ptr) {
           TSADDR* TSADDR_ptr =
               kernel_state()->memory()->TranslateVirtual<TSADDR*>(
                   TSADDR_adderess);
-
-          TSADDR_ptr->inaOnline = ip_to_in_addr("107.219.206.38");
+          TSADDR_ptr->inaOnline = ip_to_in_addr("26.23.222.2");
           TSADDR_ptr->wPortOnline = XNET_SYSTEMLINK_PORT;
 
           attributes_ptr[attribute_index].attribute_id =

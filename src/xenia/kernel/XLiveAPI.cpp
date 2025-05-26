@@ -45,7 +45,8 @@ DEFINE_string(network_guid, "", "Network Interface GUID", "Live");
 
 DEFINE_string(friends_xuids, "", "Comma delimited list of XUIDs. (Max 100)",
               "Live");
-
+DEFINE_string(static_host_ip, "", "Force host ip address.",
+              "Live");
 DEFINE_bool(xstorage_backend, true,
             "Request XStorage content from backend and fallback locally, "
             "otherwise only use local content.",
@@ -620,7 +621,10 @@ sockaddr_in XLiveAPI::Getwhoami() {
 
   const char* address_str = doc["address"].GetString();
 
-  if (address_str) {
+  if (!cvars::static_host_ip.empty()) {
+    addr = ip_to_sockaddr(cvars::static_host_ip);
+  }
+  else if (address_str) {
     addr = ip_to_sockaddr(address_str);
   }
 
