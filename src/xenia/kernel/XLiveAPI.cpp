@@ -45,7 +45,7 @@ DEFINE_string(network_guid, "", "Network Interface GUID", "Live");
 
 DEFINE_string(friends_xuids, "", "Comma delimited list of XUIDs. (Max 100)",
               "Live");
-
+DEFINE_string(static_host_ip, "", "Force host ip address.", "Live");
 DEFINE_bool(xstorage_backend, true,
             "Request XStorage content from backend and fallback locally, "
             "otherwise only use local content.",
@@ -620,7 +620,9 @@ sockaddr_in XLiveAPI::Getwhoami() {
 
   const char* address_str = doc["address"].GetString();
 
-  if (address_str) {
+  if (!cvars::static_host_ip.empty()) {
+    addr = ip_to_sockaddr(cvars::static_host_ip);
+  } else if (address_str) {
     addr = ip_to_sockaddr(address_str);
   }
 
@@ -1655,6 +1657,33 @@ XLiveAPI::XStorageEnumerate(std::string server_path, uint32_t max_items) {
   enumeration_result.second = true;
 
   return enumeration_result;
+}
+
+HTTP_STATUS_CODE XLiveAPI::GetTsById(uint32_t serviceId, TSADDR* tsaddr) {
+  std::string endpoint = fmt::format("title/{:08X}/services/{:08X}",
+                                     kernel_state()->title_id(), serviceId);
+
+  std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint);
+
+  HTTP_STATUS_CODE status =
+      static_cast<HTTP_STATUS_CODE>(response->StatusCode());
+
+  if (status != HTTP_STATUS_CODE::HTTP_OK) {
+    XELOGE("GetTsById error message: {}", response->Message());
+    assert_always();
+
+    return status;
+  }
+
+  std::unique_ptr<ServiceInfoObjectJSON> service_info =
+      response->Deserialize<ServiceInfoObjectJSON>();
+
+  XELOGD("GetTsById IP: {}", service_info->Address());
+
+  tsaddr->inaOnline = ip_to_in_addr(service_info->Address());
+  tsaddr->wPortOnline = service_info->Port();
+
+  return status;
 }
 
 std::unique_ptr<FindUsersObjectJSON> XLiveAPI::GetFindUsers(
