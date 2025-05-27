@@ -176,7 +176,9 @@ class XLiveAPI {
                                                 std::span<uint8_t> buffer);
 
   static std::pair<std::unique_ptr<XStorageFilesInfoObjectJSON>, bool>
-  XStorageEnumerate(std::string server_path, uint32_t max_items);
+  XStorageEnumerate(std::string server_path, uint32_t max_items);\
+
+  static HTTP_STATUS_CODE GetTsById(uint32_t serviceId, TSADDR* tsaddr);
 
   static std::unique_ptr<FindUsersObjectJSON> GetFindUsers(
       const std::vector<FIND_USER_INFO>& find_users_info);

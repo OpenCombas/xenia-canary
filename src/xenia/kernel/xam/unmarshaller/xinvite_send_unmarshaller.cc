@@ -55,9 +55,9 @@ X_HRESULT XInviteSendUnmarshaller::Deserialize() {
     assert_always(std::format("{} deserialization incomplete", __func__));
   }
 
-  if (display_string_size_ > X_ONLINE_MAX_XINVITE_DISPLAY_STRING) {
-    return X_E_INVALIDARG;
-  }
+  //if (display_string_size_ > X_ONLINE_MAX_XINVITE_DISPLAY_STRING) {
+  //  return X_E_INVALIDARG;
+  //}
 
   return X_E_SUCCESS;
 }
