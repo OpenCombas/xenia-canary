@@ -77,12 +77,15 @@ X_RESULT XSession::CreateSession(uint8_t user_index, uint8_t public_slots,
   // - Create when joining a session
   // - Explicitly create a presence session (Frogger without HOST bit)
   // Based on Presence flag set?
-
+  if (IsSystemlinkFlags(flags) &&
+      cvars::network_mode == NETWORK_MODE::XBOXLIVE) {
+    flags = 0x706;
+  }
   if (IsSystemlinkFlags(flags)) {
     is_systemlink_ = true;
   }
 
-  if (flags == STATS) {
+  if (flags == STATS || ( cvars::network_mode != 1 && is_systemlink_ )) {
     CreateStatsSession(SessionInfo_ptr, Nonce_ptr, user_index, public_slots,
                        private_slots, flags);
   } else if (HasSessionFlag((SessionFlags)flags, HOST) ||
@@ -137,7 +140,7 @@ X_RESULT XSession::CreateHostSession(XSESSION_INFO* session_info,
 
   const uint64_t systemlink_id = XLiveAPI::systemlink_id;
 
-  if (IsSystemlink()) {
+  if (IsSystemlink() && cvars::network_mode == NETWORK_MODE::LAN) {
     XELOGI("Creating systemlink session");
 
     // If XNetRegisterKey did not register key then we must register it here
