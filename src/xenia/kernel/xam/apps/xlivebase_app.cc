@@ -1394,7 +1394,7 @@ X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr) {
           std::format("{}\\{}", item_parent, entry->name());
 
       // Path must use /
-      // Keep server return consitant with XStorageBuildServerPath
+      // Keep server return consistent with XStorageBuildServerPath
       std::u16string backend_storage_item_path =
           xe::to_utf16(ConvertXStorageSymlinkToServerPath(symlink_item_path));
 
@@ -1747,8 +1747,9 @@ X_HRESULT XLiveBaseApp::XStorageUploadFromMemory(uint32_t buffer_ptr) {
 
       if (!result) {
         size_t bytes_written = 0;
-        result = upload_file->WriteSync({upload_buffer.data(), buffer_size}, 0,
-                                        &bytes_written);
+        result = upload_file->WriteSync(
+            {upload_buffer.data(), unmarshaller->BufferSize()}, 0,
+            &bytes_written);
 
         // Update the size of the entry for XStorageDownloadToMemory
         upload_file->entry()->update();
