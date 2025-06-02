@@ -137,7 +137,7 @@ X_RESULT XSession::CreateHostSession(XSESSION_INFO* session_info,
 
   const uint64_t systemlink_id = XLiveAPI::systemlink_id;
 
-  if (IsSystemlink()) {
+  if (IsSystemlink() && cvars::network_mode == NETWORK_MODE::LAN) {
     XELOGI("Creating systemlink session");
 
     // If XNetRegisterKey did not register key then we must register it here
@@ -334,7 +334,8 @@ X_RESULT XSession::JoinSession(XGI_SESSION_MANAGE* data) {
 
   local_details_.ReturnedMemberCount = GetMembersCount();
 
-  if (!members.empty() && IsHost() && IsXboxLive()) {
+  if (!members.empty() && IsHost() &&
+      cvars::network_mode == NETWORK_MODE::XBOXLIVE) {
     XLiveAPI::SessionJoinRemote(session_id_, members);
   } else {
     // To improve XNetInAddrToXnAddr stability each members session id
