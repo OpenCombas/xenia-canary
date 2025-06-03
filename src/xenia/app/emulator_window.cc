@@ -205,6 +205,8 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
                 XE_BUILD_BRANCH "@" XE_BUILD_COMMIT_SHORT " on " XE_BUILD_DATE
                 ")";
 
+  updater_ = new Updater("AdrianCassar", "xenia-canary");
+
   LoadRecentlyLaunchedTitles();
 }
 
@@ -969,13 +971,9 @@ bool EmulatorWindow::Initialize() {
 
     Netplay_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
 
-    Netplay_menu->AddChild(
-        MenuItem::Create(MenuItem::Type::kString, "&Update Netplay", []() {
-          LaunchWebBrowser(
-              "https://nightly.link/AdrianCassar/xenia-canary/workflows/"
-              "Windows_build/netplay_canary_experimental/"
-              "xenia_canary_netplay_windows.zip");
-        }));
+    Netplay_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "&Update Checker",
+        std::bind(&EmulatorWindow::ToggleUpdaterDialog, this)));
   }
   main_menu->AddChild(std::move(Netplay_menu));
 
@@ -1835,6 +1833,21 @@ void EmulatorWindow::ToggleFriendsDialog() {
   }
 }
 
+void EmulatorWindow::ToggleUpdaterDialog() {
+  if (!updater_dialog_) {
+    disable_hotkeys_ = true;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI, 1);
+    updater_dialog_ =
+        std::make_unique<UpdaterDialog>(updater_, imgui_drawer_.get(), this);
+    emulator_->kernel_state()->xam_state()->xam_dialogs_shown_++;
+  } else {
+    disable_hotkeys_ = false;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI, 0);
+    updater_dialog_.reset();
+    emulator_->kernel_state()->xam_state()->xam_dialogs_shown_--;
+  }
+}
+
 void EmulatorWindow::ToggleControllerVibration() {
   auto input_sys = emulator()->input_system();
   if (input_sys) {
@@ -2549,7 +2562,12 @@ xe::X_STATUS EmulatorWindow::RunTitle(
   }
 
   if (friends_manager_dialog_) {
-    profile_config_dialog_.reset();
+    friends_manager_dialog_.reset();
+    emulator_->kernel_state()->xam_state()->xam_dialogs_shown_--;
+  }
+
+  if (updater_dialog_) {
+    updater_dialog_.reset();
     emulator_->kernel_state()->xam_state()->xam_dialogs_shown_--;
   }
 
@@ -2696,6 +2714,10 @@ void EmulatorWindow::ClearDialogs() {
 
   if (friends_manager_dialog_) {
     friends_manager_dialog_.reset();
+  }
+
+  if (updater_dialog_) {
+    updater_dialog_.reset();
   }
 
   imgui_drawer_.get()->ClearDialogs();
