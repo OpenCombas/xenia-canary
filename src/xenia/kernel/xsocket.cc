@@ -11,13 +11,20 @@
 
 #include <cstring>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/platform.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 // #include "xenia/kernel/xnet.h"
 
+
+#include <third_party/libjuice/include/juice/juice.h>
+
+
 #include <xenia/kernel/XLiveAPI.h>
+
+DECLARE_bool(juice_socket, true, "Whether to use juice sockets for NAT tunneling")
 
 using namespace std::chrono_literals;
 
@@ -174,6 +181,10 @@ X_STATUS XSocket::Bind(const XSOCKADDR_IN* name, int name_len) {
       XLiveAPI::upnp_handler->GetMappedBindPort(name->address_port);
 
   sockaddr addr = sa_in.to_host();
+
+  if (cvars::juice_socket) {
+  
+  }
 
   int ret = bind(native_handle_, &addr, name_len);
   if (ret < 0) {

@@ -19,6 +19,7 @@
 #include "xenia/kernel/upnp.h"
 #include "xenia/kernel/util/net_utils.h"
 #include "xenia/kernel/xnet.h"
+#include "xenia/kernel/juicesocket.h"
 
 #include "xenia/kernel/json/arbitration_object_json.h"
 #include "xenia/kernel/json/delete_my_profiles_json.h"
@@ -26,6 +27,7 @@
 #include "xenia/kernel/json/friend_presence_object_json.h"
 #include "xenia/kernel/json/http_response_object_json.h"
 #include "xenia/kernel/json/leaderboard_object_json.h"
+#include "xenia/kernel/json/nic_object_json.h"
 #include "xenia/kernel/json/player_object_json.h"
 #include "xenia/kernel/json/presence_object_json.h"
 #include "xenia/kernel/json/properties_object_json.h"
@@ -94,6 +96,11 @@ class XLiveAPI {
   static const uint64_t GetLocalMachineId();
 
   static std::unique_ptr<HTTPResponseObjectJSON> RegisterPlayer();
+
+  static std::unique_ptr<HTTPResponseObjectJSON> RegisterNic();
+
+  static std::unique_ptr<HTTPResponseObjectJSON> UpdateNicSdp(
+      std::string sdp);
 
   static const std::map<uint64_t, std::string> DeleteMyProfiles();
 

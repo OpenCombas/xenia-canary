@@ -17,6 +17,10 @@
 #include "xenia/base/byte_order.h"
 #include "xenia/base/math.h"
 #include "xenia/kernel/xobject.h"
+#include "xenia/kernel/juicesocket.h"
+
+#include <third_party/libjuice/include/juice/juice.h>
+
 
 #ifdef XE_PLATFORM_WIN32
 // clang-format off

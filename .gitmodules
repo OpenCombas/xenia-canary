@@ -115,3 +115,6 @@
 [submodule "third_party/wolfssl"]
 	path = third_party/wolfssl
 	url = https://github.com/wolfssl/wolfssl.git
+[submodule "third_party/libjuice"]
+	path = third_party/libjuice
+	url = https://github.com/paullouisageneau/libjuice
