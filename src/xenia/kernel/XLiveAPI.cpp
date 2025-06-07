@@ -384,8 +384,6 @@ void XLiveAPI::Init() {
 
   std::unique_ptr<HTTPResponseObjectJSON> reg_result = RegisterPlayer();
 
-  std::unique_ptr<HTTPResponseObjectJSON> reg_nic_result = RegisterNic();
-
   if (reg_result &&
       reg_result->StatusCode() == HTTP_STATUS_CODE::HTTP_CREATED) {
     const uint32_t index = 0;
@@ -735,8 +733,8 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterPlayer() {
 }
 
 // Register Network information to networks table
-std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterNic() {
-  assert_not_null(mac_address_);
+std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterSdp(in_addr remote_ip,
+                                                              char sdp[4096]) {
 
   std::unique_ptr<HTTPResponseObjectJSON> response{};
 
@@ -745,43 +743,15 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterNic() {
 
   NicObjectJSON nic = NicObjectJSON();
 
-  nic.IpAddress(OnlineIP_str());
-  nic.MacAddress(mac_address_->to_uint64());
-
-  std::string network_output;
-  bool valid = nic.Serialize(network_output);
-  assert_true(valid);
-
-  response = Post("networks", (uint8_t*)network_output.c_str());
-
-  if (response->StatusCode() != HTTP_STATUS_CODE::HTTP_CREATED) {
-    assert_always();
-    return response;
-  }
-
-  XELOGI("POST Success");
-
-  return response;
-}
-
-// Register Network information to networks table
-std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::UpdateNicSdp(std::string sdp) {
-  assert_not_null(mac_address_);
-
-  std::unique_ptr<HTTPResponseObjectJSON> response{};
-
-  const uint32_t index = 0;
-
-  NicObjectJSON nic = NicObjectJSON();
-  nic.IpAddress(OnlineIP_str());
-  nic.MacAddress(mac_address_->to_uint64());
+  nic.LocalIpAddress(OnlineIP_str());
+  nic.RemoteIpAddress(ip_to_string(remote_ip));
   nic.Sdp(sdp);
 
   std::string network_output;
   bool valid = nic.Serialize(network_output);
   assert_true(valid);
 
-  response = Post("setsdp", (uint8_t*)network_output.c_str());
+  response = Post("networks", (uint8_t*)network_output.c_str());
 
   if (response->StatusCode() != HTTP_STATUS_CODE::HTTP_CREATED) {
     assert_always();

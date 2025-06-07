@@ -29,7 +29,7 @@ namespace kernel {
 
 class JuiceSocket {
  public:
-  JuiceSocket();
+  JuiceSocket(in_addr remote_ip);
   ~JuiceSocket();
 
   // Mimic socket functions
@@ -48,7 +48,7 @@ class JuiceSocket {
 
 
   int setLocalSdp() const;
-  void setRemoteSdp(in_addr address_ip) const;
+  void RegisterSDP(in_addr address_ip) const;
 
  private:
   static void onData(juice_agent_t* agent, const char* data, size_t size,
@@ -61,6 +61,9 @@ class JuiceSocket {
 
   juice_agent_t* agent;
   juice_config_t config;
+  char local_sdp[JUICE_MAX_SDP_STRING_LEN];
+  char remote_sdp[JUICE_MAX_SDP_STRING_LEN];
+
 
   std::string turnServer;
   std::string username;

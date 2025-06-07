@@ -16,27 +16,23 @@
 namespace xe {
 namespace kernel {
 NicObjectJSON::NicObjectJSON()
-      : ipAddress_(""),
-        macAddress_(0), 
+      : localIpAddress_(""), remoteIpAddress_(""), 
         sdp_("") {}
 
 NicObjectJSON::~NicObjectJSON() {}
 
 bool NicObjectJSON::Deserialize(const rapidjson::Value& obj) {
 
-  if (obj.HasMember("ipAddress")) {
-    IpAddress(obj["ipAddress"].GetString());
+  if (obj.HasMember("localIpAddress")) {
+    LocalIpAddress(obj["localIpAddress"].GetString());
   }
 
-  if (obj.HasMember("macAddress")) {
-    xe::kernel::MacAddress address =
-        xe::kernel::MacAddress(obj["macAddress"].GetString());
-
-    MacAddress(address.to_uint64());
+  if (obj.HasMember("remoteIpAddress")) {
+    RemoteIpAddress(obj["remoteIpAddress"].GetString());
   }
 
   if (obj.HasMember("sdp")) {
-    IpAddress(obj["sdp"].GetString());
+    Sdp(obj["sdp"].GetString());
   }
 
 
@@ -47,11 +43,11 @@ bool NicObjectJSON::Serialize(
     rapidjson::PrettyWriter<rapidjson::StringBuffer>* writer) const {
   writer->StartObject();
 
-  writer->String("ipAddress");
-  writer->String(ipAddress_);
+  writer->String("localIpAddress");
+  writer->String(localIpAddress_);
 
-  writer->String("macAddress");
-  writer->String(fmt::format("{:012x}", macAddress_.get()));
+  writer->String("remoteIpAddress");
+  writer->String(remoteIpAddress_);
 
   writer->String("sdp");
   writer->String(sdp_);

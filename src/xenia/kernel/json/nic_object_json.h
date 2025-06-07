@@ -28,22 +28,22 @@ class NicObjectJSON : public BaseObjectJSON {
   virtual bool Serialize(
       rapidjson::PrettyWriter<rapidjson::StringBuffer>* writer) const;
 
-  const std::string& IpAddress() const { return ipAddress_; }
-  void IpAddress(const std::string& ipAddress) {
-    ipAddress_ = ipAddress;
+  const std::string& LocalIpAddress() const { return localIpAddress_; }
+  void LocalIpAddress(const std::string& localIpAddress) {
+    localIpAddress_ = localIpAddress;
   }
 
-  const xe::be<uint64_t>& MacAddress() const { return macAddress_; }
-  void MacAddress(const xe::be<uint64_t>& macAddress) {
-    macAddress_ = macAddress;
+  const std::string& RemoteIpAddress() const { return remoteIpAddress_; }
+  void RemoteIpAddress(const std::string& remoteIpAddress) {
+    remoteIpAddress_ = remoteIpAddress;
   }
 
   const std::string& Sdp() const { return sdp_; }
   void Sdp(const std::string& sdp) { sdp_ = sdp; }
 
  private:
-  std::string ipAddress_;
-  xe::be<uint64_t> macAddress_;  // 6 Bytes
+  std::string localIpAddress_;
+  std::string remoteIpAddress_;
   std::string sdp_;
 };
 

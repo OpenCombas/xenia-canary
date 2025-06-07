@@ -97,10 +97,8 @@ class XLiveAPI {
 
   static std::unique_ptr<HTTPResponseObjectJSON> RegisterPlayer();
 
-  static std::unique_ptr<HTTPResponseObjectJSON> RegisterNic();
-
-  static std::unique_ptr<HTTPResponseObjectJSON> UpdateNicSdp(
-      std::string sdp);
+  static std::unique_ptr<HTTPResponseObjectJSON> RegisterSdp(in_addr remote_ip,
+                                                      char sdp[4096]);
 
   static const std::map<uint64_t, std::string> DeleteMyProfiles();
 
