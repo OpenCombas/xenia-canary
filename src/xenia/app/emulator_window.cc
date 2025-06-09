@@ -1013,6 +1013,9 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     return;
   }
 
+  std::string notificationTitle = "";
+  std::string notificationDesc = "";
+
   switch (e.virtual_key()) {
     case ui::VirtualKey::kO: {
       if (!e.is_ctrl_pressed()) {
@@ -1035,7 +1038,9 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     } break;
 
     case ui::VirtualKey::kF4: {
-      GpuTraceFrame();
+      ToggleGPUSetting(GPUSetting::ReadbackResolve);
+      notificationTitle = "Toggle Readback Resolve";
+      notificationDesc = cvars::readback_resolve ? "Enabled" : "Disabled";
     } break;
     case ui::VirtualKey::kF5: {
       GpuClearCaches();
@@ -1095,6 +1100,13 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
 
     default:
       return;
+  }
+  if (!notificationTitle.empty()) {
+    app_context_.CallInUIThread(
+        [imgui_drawer = imgui_drawer(), notificationTitle, notificationDesc]() {
+          new xe::ui::HostNotificationWindow(imgui_drawer, notificationTitle,
+                                             notificationDesc, 0);
+        });
   }
 
   e.set_handled(true);
