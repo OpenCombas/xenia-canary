@@ -13,6 +13,8 @@
 #include "xenia/kernel/kernel_state.h"
 
 
+
+
 #include "third_party/libcurl/include/curl/curl.h"
 #include <third_party/libjuice/include/juice/juice.h>
 #include <winsock2.h>
@@ -29,11 +31,11 @@ namespace kernel {
 
 class JuiceSocket {
  public:
-  JuiceSocket(in_addr remote_ip);
+  JuiceSocket();
   ~JuiceSocket();
 
   // Mimic socket functions
-  X_STATUS bind(const sockaddr* name, int namelen);  // Placeholder, no-op
+  int bind(xe::be<uint16_t>);  // Placeholder, no-op
   X_STATUS connect(const std::string& remoteSdp);
   int recv(char* buffer, int len, int flags);
   int recvfrom(char* buffer, int len, int flags, sockaddr* from,
@@ -48,7 +50,8 @@ class JuiceSocket {
 
 
   int setLocalSdp() const;
-  void RegisterSDP(in_addr address_ip) const;
+  //void RegisterSDP(in_addr address_ip) const;
+  void RegisterPeer(in_addr address_ip, xe::be<uint16_t> port) const;
 
  private:
   static void onData(juice_agent_t* agent, const char* data, size_t size,
@@ -61,8 +64,6 @@ class JuiceSocket {
 
   juice_agent_t* agent;
   juice_config_t config;
-  char local_sdp[JUICE_MAX_SDP_STRING_LEN];
-  char remote_sdp[JUICE_MAX_SDP_STRING_LEN];
 
 
   std::string turnServer;

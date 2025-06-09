@@ -24,7 +24,8 @@
 
 #include <xenia/kernel/XLiveAPI.h>
 
-DECLARE_bool(juice_socket, true, "Whether to use juice sockets for NAT tunneling")
+DEFINE_bool(juice_socket, true,
+            "Whether to use juice sockets for NAT tunneling", "Live");
 
 using namespace std::chrono_literals;
 
@@ -182,8 +183,8 @@ X_STATUS XSocket::Bind(const XSOCKADDR_IN* name, int name_len) {
 
   sockaddr addr = sa_in.to_host();
 
-  if (cvars::juice_socket) {
-  
+  if (proto_ == X_IPPROTO_UDP) {
+    juiceSocket_.bind(sa_in.address_port);
   }
 
   int ret = bind(native_handle_, &addr, name_len);
@@ -520,6 +521,10 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
       XLiveAPI::upnp_handler->GetMappedBindPort(to->address_port);
 
   sockaddr addr = to->to_host();
+
+  if (!peers.contains(ip_to_string(to->address_ip))) {
+    juiceSocket_.RegisterPeer(to->address_ip, to->address_port);
+  }
 
   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
                 to ? &addr : nullptr, to_len);

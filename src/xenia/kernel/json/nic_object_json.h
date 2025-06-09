@@ -33,9 +33,9 @@ class NicObjectJSON : public BaseObjectJSON {
     localIpAddress_ = localIpAddress;
   }
 
-  const std::string& RemoteIpAddress() const { return remoteIpAddress_; }
-  void RemoteIpAddress(const std::string& remoteIpAddress) {
-    remoteIpAddress_ = remoteIpAddress;
+  const xe::be<uint16_t> port() const { return port_; }
+  void port(const xe::be<uint16_t> port) {
+    port_ = port;
   }
 
   const std::string& Sdp() const { return sdp_; }
@@ -43,7 +43,7 @@ class NicObjectJSON : public BaseObjectJSON {
 
  private:
   std::string localIpAddress_;
-  std::string remoteIpAddress_;
+  xe::be<uint16_t> port_;
   std::string sdp_;
 };
 

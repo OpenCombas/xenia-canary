@@ -3,6 +3,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 
+
 #include <third_party/libjuice/include/juice/juice.h>
 
 #include <xenia/kernel/XLiveAPI.h>
@@ -14,24 +15,19 @@ DEFINE_string(turn_server_username, "", "TURN server username", "Live");
 
 DEFINE_string(turn_server_password, "", "TURN server password", "Live");
 
-DECLARE_int32(turn_server_port, 3478, "TURN server port.");
+DEFINE_int32(turn_server_port, 3478, "TURN server port.", "Live");
 
 namespace xe {
 namespace kernel {
 
-JuiceSocket::JuiceSocket(in_addr remote_ip)
+JuiceSocket::JuiceSocket()
     : agent(nullptr),
       connectionState(JUICE_STATE_DISCONNECTED) {
-  WSADATA wsa;
-  WSAStartup(MAKEWORD(2, 2), &wsa);
-  juice_config_t config;
 
   memset(&config, 0, sizeof(config));
-  config.user_ptr = this;
   config.stun_server_host = cvars::turn_server_host.c_str();
   config.stun_server_port = cvars::turn_server_port;
-
-  juice_config_t config;
+;
   memset(&config, 0, sizeof(config));
 
 
@@ -42,25 +38,37 @@ JuiceSocket::JuiceSocket(in_addr remote_ip)
   turn_server.username = cvars::turn_server_username.c_str();
   turn_server.password = cvars::turn_server_password.c_str();
 
+
+  config.stun_server_host = cvars::turn_server_host.c_str();
+  config.stun_server_port = cvars::turn_server_port;
   config.turn_servers = &turn_server;
   config.turn_servers_count = 1;
   config.cb_recv = &JuiceSocket::onData;
   config.cb_candidate = &JuiceSocket::onCandidate;
   config.cb_gathering_done = &JuiceSocket::onGatheringDone;
   config.cb_state_changed = &JuiceSocket::onStateChanged;
+  config.user_ptr = this;
+
 
   agent = juice_create(&config);
-
-  juice_get_local_description(agent, local_sdp, JUICE_MAX_SDP_STRING_LEN);
-  RegisterSDP(remote_ip);
-  
 }
 
 JuiceSocket::~JuiceSocket() {
   if (agent) juice_destroy(agent);
 }
 
-X_STATUS JuiceSocket::bind(const sockaddr* name, int namelen) {
+int JuiceSocket::bind(xe::be<uint16_t> port) {
+  char sdpbuffer[4096];
+  juice_get_local_description(agent, sdpbuffer, JUICE_MAX_SDP_STRING_LEN);
+  std::string sdp(sdpbuffer);
+  juice_gather_candidates(agent);
+  std::unique_ptr<HTTPResponseObjectJSON> register_sdp_result =
+      XLiveAPI::RegisterSdp(port, sdp);
+
+  if (register_sdp_result &&
+      register_sdp_result->StatusCode() == HTTP_STATUS_CODE::HTTP_CREATED) {
+    XELOGI("Successfully posted SDP");
+  }
   return 0;
 }
 
@@ -134,18 +142,16 @@ int JuiceSocket::setLocalSdp() const {
     XELOGI("Successfully registered ");
   } 
 
+  return 0;
 }
 
-void JuiceSocket::RegisterSDP(in_addr address_ip) const {
-  char sdp[4096];
-  juice_set_remote_description(agent, sdp);
-  juice_gather_candidates(agent);
-  std::unique_ptr<HTTPResponseObjectJSON> register_sdp_result =
-      XLiveAPI::RegisterSdp(address_ip, sdp);
+void JuiceSocket::RegisterPeer(in_addr address_ip,
+                               xe::be<uint16_t> port) const {
+  std::string remote_sdp = XLiveAPI::GetSdp(address_ip, port);
 
-  if (register_sdp_result &&
-      register_sdp_result->StatusCode() == HTTP_STATUS_CODE::HTTP_CREATED) {
-    XELOGI("Successfully posted SDP");
+  if (!remote_sdp.empty()) {
+    juice_set_remote_description(agent, remote_sdp.c_str());
+    juice_gather_candidates(agent);
   }
 }
 

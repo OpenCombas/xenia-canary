@@ -733,8 +733,8 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterPlayer() {
 }
 
 // Register Network information to networks table
-std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterSdp(in_addr remote_ip,
-                                                              char sdp[4096]) {
+std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterSdp(xe::be<uint16_t> port,
+                                                    std::string sdp) {
 
   std::unique_ptr<HTTPResponseObjectJSON> response{};
 
@@ -744,7 +744,7 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterSdp(in_addr remote_ip,
   NicObjectJSON nic = NicObjectJSON();
 
   nic.LocalIpAddress(OnlineIP_str());
-  nic.RemoteIpAddress(ip_to_string(remote_ip));
+  nic.port(port);
   nic.Sdp(sdp);
 
   std::string network_output;
@@ -761,6 +761,33 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterSdp(in_addr remote_ip,
   XELOGI("POST Success");
 
   return response;
+}
+
+std::string XLiveAPI::GetSdp(in_addr ip_addr, xe::be<uint16_t> port) {
+  std::unique_ptr<HTTPResponseObjectJSON> response{};
+
+  // User index hard-coded
+  const uint32_t index = 0;
+  NicObjectJSON nic = NicObjectJSON();
+  nic.LocalIpAddress(ip_to_string(ip_addr));
+  nic.port(port);
+  nic.Sdp("");
+
+  std::string network_output;
+  bool valid = nic.Serialize(network_output);
+  assert_true(valid);
+
+  response = Post("networks/find", (uint8_t*)network_output.c_str());
+  const auto nic_response = response->Deserialize<NicObjectJSON>();
+
+  if (response->StatusCode() != HTTP_STATUS_CODE::HTTP_CREATED) {
+    assert_always();
+    return nic_response->Sdp();
+  }
+
+  XELOGI("POST Success");
+
+  return nic_response->Sdp();
 }
 
 const std::map<uint64_t, std::string> XLiveAPI::DeleteMyProfiles() {

@@ -12,6 +12,7 @@ project("xenia-kernel")
     "zlib",
     "pugixml",
     "libcurl",
+    "libjuice",
     "miniupnp",
     "xenia-apu",
     "xenia-base",
@@ -21,7 +22,8 @@ project("xenia-kernel")
   })
   defines({
     "CURL_STATICLIB",
-    "MINIUPNP_STATICLIB"
+    "MINIUPNP_STATICLIB",
+    "JUICE_STATIC"
   })
   recursive_platform_files()
   files({

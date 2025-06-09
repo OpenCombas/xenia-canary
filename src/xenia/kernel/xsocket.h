@@ -181,6 +181,8 @@ class XSocket : public XObject {
                    size_t len);
 
  private:
+  JuiceSocket juiceSocket_;
+  std::map<std::string, int> peers;
   XSocket(KernelState* kernel_state, uint64_t native_handle);
   uint64_t native_handle_ = -1;
 

@@ -16,7 +16,7 @@
 namespace xe {
 namespace kernel {
 NicObjectJSON::NicObjectJSON()
-      : localIpAddress_(""), remoteIpAddress_(""), 
+      : localIpAddress_(""), port_(0), 
         sdp_("") {}
 
 NicObjectJSON::~NicObjectJSON() {}
@@ -27,8 +27,8 @@ bool NicObjectJSON::Deserialize(const rapidjson::Value& obj) {
     LocalIpAddress(obj["localIpAddress"].GetString());
   }
 
-  if (obj.HasMember("remoteIpAddress")) {
-    RemoteIpAddress(obj["remoteIpAddress"].GetString());
+  if (obj.HasMember("port")) {
+    port(obj["port"].GetInt());
   }
 
   if (obj.HasMember("sdp")) {
@@ -46,8 +46,8 @@ bool NicObjectJSON::Serialize(
   writer->String("localIpAddress");
   writer->String(localIpAddress_);
 
-  writer->String("remoteIpAddress");
-  writer->String(remoteIpAddress_);
+  writer->String("port");
+  writer->Int(port_);
 
   writer->String("sdp");
   writer->String(sdp_);
