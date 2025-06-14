@@ -11,13 +11,23 @@
 
 #include <cstring>
 
+
 #include "xenia/base/platform.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+#include "xenia/base/cvar.h"
 // #include "xenia/kernel/xnet.h"
 
 #include <xenia/kernel/XLiveAPI.h>
+
+DEFINE_string(websocket_address, "192.168.0.1",
+              "Xenia Websocket Relay Address e.g. IP or hostname", "Live");
+
+DEFINE_double(websocket_port, 8080,
+              "Xenia Websocket Relay port", "Live");
+
+DEFINE_string(websocket_path, "/ws", "Xenia Websocket Relay path", "Live");
 
 using namespace std::chrono_literals;
 
@@ -41,7 +51,10 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
     // VDP is a layer on top of UDP.
     proto = Protocol::X_IPPROTO_UDP;
   }
-
+  
+  websocket_client_.connect(
+      cvars::websocket_address,
+      static_cast<INTERNET_PORT>(cvars::websocket_port), cvars::websocket_path);
   native_handle_ = socket(af, type, proto);
   if (native_handle_ == -1) {
     return X_STATUS_UNSUCCESSFUL;
@@ -68,6 +81,7 @@ X_STATUS XSocket::Close() {
   if (ret != 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
+  websocket_client_.close();
 
   return X_STATUS_SUCCESS;
 }
@@ -189,6 +203,9 @@ X_STATUS XSocket::Bind(const XSOCKADDR_IN* name, int name_len) {
       bound_port_ = sa.address_port;
     }
   }
+  if (proto_ == X_IPPROTO_UDP) {
+    websocket_client_.bind(XLiveAPI::OnlineIP_str(), bound_port());
+  }
 
   bound_ = true;
 
@@ -247,8 +264,14 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
     sa = from->to_host();
   }
 
-  int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len,
-                     flags, from ? &sa : nullptr, (int*)from_len);
+  //int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len,
+  //                   flags, from ? &sa : nullptr, (int*)from_len);
+  int ret =
+      websocket_client_.recvfrom(buf, buf_len, from ? &sa : nullptr, from_len);
+  if (ret == 0) {
+    SetLastWSAError(X_WSAError::X_WSAEWOULDBLOCK);
+  }
+  return ret;
 
   if (from) {
     from->to_guest(&sa);
@@ -510,8 +533,13 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
 
   sockaddr addr = to->to_host();
 
-  return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
-                to ? &addr : nullptr, to_len);
+  //return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+  //              to ? &addr : nullptr, to_len);
+  int res = websocket_client_.sendto(buf, buf_len, to ? &addr : nullptr, to_len);
+  if (res == -1) {
+    SetLastWSAError(X_WSAError::X_WSAEWOULDBLOCK);
+  } 
+  return res;
 }
 
 int XSocket::WSAEventSelect(uint64_t socket_handle, uint64_t event_handle,

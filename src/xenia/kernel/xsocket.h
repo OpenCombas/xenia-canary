@@ -17,6 +17,7 @@
 #include "xenia/base/byte_order.h"
 #include "xenia/base/math.h"
 #include "xenia/kernel/xobject.h"
+#include "xenia/kernel/websocket.h"
 
 #ifdef XE_PLATFORM_WIN32
 // clang-format off
@@ -204,6 +205,7 @@ class XSocket : public XObject {
   std::condition_variable receive_cv_;
   std::mutex receive_socket_mutex_;
   XWSAOVERLAPPED* active_overlapped_ = nullptr;
+  WebSocketClient websocket_client_ = WebSocketClient();
 
   int PollWSARecvFrom(bool wait, struct WSARecvFromData data);
 
