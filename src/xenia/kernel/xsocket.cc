@@ -203,7 +203,7 @@ X_STATUS XSocket::Bind(const XSOCKADDR_IN* name, int name_len) {
       bound_port_ = sa.address_port;
     }
   }
-  if (proto_ == X_IPPROTO_UDP) {
+  if (proto_ == X_IPPROTO_UDP || proto_ == Protocol::X_IPPROTO_VDP) {
     websocket_client_.bind(XLiveAPI::OnlineIP_str(), bound_port());
   }
 

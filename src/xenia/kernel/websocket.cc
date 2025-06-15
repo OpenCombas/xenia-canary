@@ -116,7 +116,7 @@ int WebSocketClient::recvfrom(uint8_t* buffer, uint32_t buf_len, sockaddr* from,
 
   // Copy payload to buffer
   int len = std::min((int)msg.Payload().size(), (int)buf_len);
-  memcpy(buffer, msg.Payload().data(), len - 1);
+  memcpy(buffer, msg.Payload().data(), len - 2);
 
   // Populate sockaddr_in
   sockaddr_in* sin = reinterpret_cast<sockaddr_in*>(from);
@@ -125,7 +125,7 @@ int WebSocketClient::recvfrom(uint8_t* buffer, uint32_t buf_len, sockaddr* from,
   inet_pton(AF_INET, msg.SourceIp().c_str(), &sin->sin_addr);
   *from_len = sizeof(sockaddr_in);
 
-  return len - 1;
+  return len - 2;
 }
 
 void WebSocketClient::enqueue_message(WebsocketPacketObjectJSON msg) {
