@@ -268,10 +268,11 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
   //                   flags, from ? &sa : nullptr, (int*)from_len);
   int ret =
       websocket_client_.recvfrom(buf, buf_len, from ? &sa : nullptr, from_len);
-  if (ret == 0) {
-    SetLastWSAError(X_WSAError::X_WSAEWOULDBLOCK);
-  }
-  return ret;
+  //if (ret == 0) {
+  //  SetLastWSAError(X_WSAError::X_WSAEWOULDBLOCK);
+  //  return SOCKET_ERROR;
+  //}
+  //return ret;
 
   if (from) {
     from->to_guest(&sa);

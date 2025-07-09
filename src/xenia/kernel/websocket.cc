@@ -104,7 +104,7 @@ int WebSocketClient::sendto(uint8_t* buf, uint32_t buf_len,
 
 int WebSocketClient::recvfrom(uint8_t* buffer, uint32_t buf_len, sockaddr* from,
                               uint32_t* from_len) {
-  std::unique_lock<std::mutex> lock(queue_mutex);
+  //std::unique_lock<std::mutex> lock(queue_mutex);
 
   if (msg_queue.empty()) {
     return 0;  // Indicate that no message is currently available
@@ -112,7 +112,7 @@ int WebSocketClient::recvfrom(uint8_t* buffer, uint32_t buf_len, sockaddr* from,
 
   WebsocketPacketObjectJSON msg = msg_queue.front();
   msg_queue.pop();
-  lock.unlock();
+  //lock.unlock();
 
   // Copy payload to buffer
   int len = std::min((int)msg.Payload().size(), (int)buf_len);
