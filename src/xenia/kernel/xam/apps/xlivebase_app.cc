@@ -96,8 +96,8 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
                   buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       // 534507D4 - XStorageUploadFromMemory
       // 4D5307D3, 415607F7, 584108F0, 5454082B, 545407F8, 575207FD
-      XELOGD("XStorageEnumerate({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return XStorageEnumerate(buffer_ptr);
+      XELOGD("XStorageUploadFromMemoryHack({:08X}, {:08X})", buffer_ptr, buffer_length);
+      return XStorageUploadFromMemory(buffer_ptr);
     }
     case 0x0005000B: {
       assert_true(!buffer_length ||
@@ -1980,7 +1980,7 @@ X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
     } break;
     case X_STORAGE_FACILITY::FACILITY_PER_USER_TITLE: {
       const std::string path =
-          fmt::format("user/{:016X}/title/{:08X}/{}", xuid,
+          fmt::format("user/{:016X}/title/{:08X}/{}", 0000000000000000,
                       kernel_state()->title_id(), filename_str);
 
       backend_server_path_str =
