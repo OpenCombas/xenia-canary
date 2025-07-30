@@ -49,6 +49,8 @@ DECLARE_int32(network_mode);
 
 DECLARE_bool(xlink_kai_systemlink_hack);
 
+DECLARE_bool(qos_backend);
+
 enum XNET_QOS {
   LISTEN_ENABLE = 0x01,
   LISTEN_DISABLE = 0x02,
@@ -1230,16 +1232,12 @@ dword_result_t NetDll_XNetQosLookup_entry(
 
   for (uint32_t i = 0; i < probes; i++) {
     uint64_t session_id = session_ids[i].as_uintBE64();
-    response_data chunk = XLiveAPI::QoSGet(session_id);
+    if (cvars::qos_backend) {
+      response_data chunk = XLiveAPI::QoSGet(session_id);
 
-    if (chunk.http_code == HTTP_STATUS_CODE::HTTP_OK ||
-        chunk.http_code == HTTP_STATUS_CODE::HTTP_NO_CONTENT) {
-      qos->info[i].data_ptr = 0;
-      qos->info[i].data_len = 0;
-      qos->info[i].flags =
-          XNET_XNQOSINFO::COMPLETE | XNET_XNQOSINFO::TARGET_CONTACTED;
-
-      if (chunk.size) {
+      if ((chunk.http_code == HTTP_STATUS_CODE::HTTP_OK ||
+           chunk.http_code == HTTP_STATUS_CODE::HTTP_NO_CONTENT) &&
+          chunk.size) {
         uint32_t data_ptr =
             kernel_memory()->SystemHeapAlloc(static_cast<uint32_t>(chunk.size));
         uint32_t* data = kernel_memory()->TranslateVirtual<uint32_t*>(data_ptr);
@@ -1250,17 +1248,22 @@ dword_result_t NetDll_XNetQosLookup_entry(
         qos->info[i].data_len = static_cast<uint16_t>(chunk.size);
         qos->info[i].flags |= XNET_XNQOSINFO::DATA_RECEIVED;
       }
-
-      qos->info[i].probes_xmit = 4;
-      qos->info[i].probes_recv = 4;
-      qos->info[i].rtt_min_in_msecs = 10;
-      qos->info[i].rtt_med_in_msecs = 10;
-      qos->info[i].up_bits_per_sec = 1024 * 1024;
-      qos->info[i].down_bits_per_sec = 1024 * 1024;
-
-      qos->count_pending =
-          std::max(static_cast<int>(qos->count_pending - 1), 0);
     }
+
+    qos->info[i].data_ptr = 0;
+    qos->info[i].data_len = 0;
+    qos->info[i].flags =
+        XNET_XNQOSINFO::COMPLETE | XNET_XNQOSINFO::TARGET_CONTACTED;
+    qos->info[i].probes_xmit = 4;
+    qos->info[i].probes_recv = 4;
+    qos->info[i].rtt_min_in_msecs = 10;
+    qos->info[i].rtt_med_in_msecs = 10;
+    qos->info[i].up_bits_per_sec = 1024 * 1024;
+    qos->info[i].down_bits_per_sec = 1024 * 1024;
+
+    qos->count_pending =
+        std::max(static_cast<int>(qos->count_pending - 1), 0);
+
 
     // Prevent L4D2 removing info[probes - 1] entry
     if (i == (probes - 1)) {

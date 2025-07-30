@@ -60,6 +60,11 @@ DEFINE_int32(discord_presence_user_index, 0,
              "User profile index used for Discord rich presence [0, 3].",
              "Live");
 
+DEFINE_bool(qos_backend, false,
+            "Request QOS data from backend. Enabling this may impact "
+            "performance when searching for sessions.",
+            "Live");
+
 DECLARE_string(upnp_root);
 
 DECLARE_bool(upnp);
