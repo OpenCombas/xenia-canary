@@ -1114,7 +1114,8 @@ bool xeDrawFriendContent(xe::ui::ImGuiDrawer* imgui_drawer,
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(50, 100, 200, 50));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(0, 0, 0, 0));
     if (ImGui::Selectable(selectable_label.c_str(), false,
-                          ImGuiSelectableFlags_None, selectable_area)) {
+                          ImGuiSelectableFlags_NoAutoClosePopups,
+                          selectable_area)) {
       *selected_xuid_ = friend_xuid;
     }
     ImGui::PopStyleColor(2);
@@ -1157,6 +1158,10 @@ bool xeDrawAddFriend(xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
   ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
   if (ImGui::BeginPopupModal("Add Friend", &args.add_friend_open,
                              ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceRight, false)) {
+      ImGui::CloseCurrentPopup();
+    }
+
     ImGui::SetWindowFontScale(1.05f);
 
     ImVec2 btn_size = ImVec2(ImGui::GetContentRegionAvail().x, btn_height);
@@ -1222,8 +1227,6 @@ bool xeDrawAddFriend(xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
       ImGui::SetKeyboardFocusHere();
     }
 
-    ImVec2 drawing_start_position = ImGui::GetCursorPos();
-
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
     ImGui::InputTextWithHint("##AddFriend", "0009XXXXXXXXXXXX", args.add_xuid_,
                              sizeof(args.add_xuid_),
@@ -1232,23 +1235,13 @@ bool xeDrawAddFriend(xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
     ImGui::PopItemWidth();
 
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-      ImGui::SetTooltip("Right Click");
+      ImGui::SetTooltip("Right Click/Gamepad A");
     }
 
-    ImVec2 drawing_end_position = ImGui::GetCursorPos();
-
-    ImGui::SetCursorPos(drawing_start_position);
-
-    auto selectable_area =
-        ImVec2(drawing_end_position.x - drawing_start_position.x,
-               (drawing_end_position.y - drawing_start_position.y));
-
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(0, 0, 0, 0));
-    if (ImGui::Selectable("##SelectableAddFriend", false,
-                          ImGuiSelectableFlags_None, selectable_area)) {
+    if (ImGui::IsItemFocused() &&
+        ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceDown, false)) {
+      ImGui::OpenPopup("##AddFriendContexts");
     }
-    ImGui::PopStyleColor(2);
 
     if (ImGui::BeginPopupContextItem("##AddFriendContexts")) {
       if (ImGui::MenuItem("Paste")) {
@@ -1267,8 +1260,6 @@ bool xeDrawAddFriend(xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
 
       ImGui::EndPopup();
     }
-
-    ImGui::SetCursorPos(drawing_end_position);
 
     ImGui::BeginDisabled(!args.valid_xuid || args.are_friends || max_friends);
     if (ImGui::Button("Add", btn_size)) {
@@ -1327,6 +1318,11 @@ bool xeDrawFriendsContent(xe::ui::ImGuiDrawer* imgui_drawer,
                                  ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
     ImGui::SetWindowFontScale(1.05f);
 
+    if (!args.add_friend_args.add_friend_open &&
+        ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceRight, false)) {
+      ImGui::CloseCurrentPopup();
+    }
+
     const float window_width = ImGui::GetContentRegionAvail().x;
 
     float btn_height = 25;
@@ -1335,38 +1331,26 @@ bool xeDrawFriendsContent(xe::ui::ImGuiDrawer* imgui_drawer,
     ImVec2 half_width_btn = ImVec2(btn_width, btn_height);
 
     ImGui::Text("Search:");
-    ImVec2 drawing_start_position = ImGui::GetCursorPos();
 
     if (args.first_draw) {
       args.first_draw = false;
       ImGui::SetKeyboardFocusHere();
     }
 
+    ImVec2 search_pos_input_start = ImGui::GetCursorPos();
+
     args.filter.Draw("##Search", window_width);
 
-    ImVec2 pos = ImGui::GetItemRectMin();
-    ImVec2 size = ImGui::GetItemRectSize();
-
-    if (std::string(args.filter.InputBuf).empty()) {
-      ImGui::SetCursorScreenPos(ImVec2(pos.x + 4, pos.y + (size.y / 6)));
-      ImGui::TextDisabled("Gamertag or XUID...");
-      ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + size.y + 4));
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Right Click/Gamepad A");
     }
 
-    ImVec2 drawing_end_position = ImGui::GetCursorPos();
+    ImVec2 search_pos_input_end = ImGui::GetCursorPos();
 
-    ImGui::SetCursorPos(drawing_start_position);
-
-    auto selectable_area =
-        ImVec2(drawing_end_position.x - drawing_start_position.x,
-               (drawing_end_position.y - drawing_start_position.y));
-
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(0, 0, 0, 0));
-    if (ImGui::Selectable("##SelectableFriends", false,
-                          ImGuiSelectableFlags_None, selectable_area)) {
+    if (ImGui::IsItemFocused() &&
+        ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceDown, false)) {
+      ImGui::OpenPopup("##SearchFilter");
     }
-    ImGui::PopStyleColor(2);
 
     if (ImGui::BeginPopupContextItem("##SearchFilter")) {
       if (ImGui::MenuItem("Paste")) {
@@ -1391,6 +1375,14 @@ bool xeDrawFriendsContent(xe::ui::ImGuiDrawer* imgui_drawer,
 
       ImGui::EndPopup();
     }
+
+    if (std::string(args.filter.InputBuf).empty()) {
+      ImGui::SetCursorPos(ImVec2(search_pos_input_start.x + 4,
+                                 search_pos_input_start.y + 3.5f));
+      ImGui::TextDisabled("Gamertag or XUID...");
+    }
+
+    ImGui::SetCursorPos(search_pos_input_end);
 
     const std::string friends_count =
         fmt::format("{}/100", profile->GetFriendsCount());
@@ -1674,6 +1666,10 @@ bool xeDrawSessionsContent(
                                  ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
     ImGui::SetWindowFontScale(1.05f);
 
+    if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceRight, false)) {
+      ImGui::CloseCurrentPopup();
+    }
+
     bool in_game = kernel_state()->emulator()->title_id();
 
     if (in_game) {
@@ -1756,6 +1752,10 @@ bool xeDrawMyDeletedProfiles(
   ImGui::SetNextWindowSizeConstraints(ImVec2(250, 115), ImVec2(250, 415));
   if (ImGui::BeginPopupModal("Deleted Profiles", &args.deleted_profiles_open,
                              ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceRight, false)) {
+      ImGui::CloseCurrentPopup();
+    }
+
     float btn_width = (ImGui::GetContentRegionAvail().x * 0.5f) -
                       (ImGui::GetStyle().ItemSpacing.x * 0.5f);
     ImVec2 btn_size = ImVec2(btn_width, btn_height);
