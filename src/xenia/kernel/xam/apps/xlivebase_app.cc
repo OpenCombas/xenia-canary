@@ -98,9 +98,8 @@ X_HRESULT XLiveBaseApp::ExecuteDispatchMessage(uint32_t message,
       assert_true(!buffer_length ||
                   buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
       // 43430821
-      XELOGD("XStorageUploadFromMemory({:08X}, {:08X})", buffer_ptr,
-             buffer_length);
-      return XStorageUploadFromMemory(buffer_ptr);
+      XELOGD("XStringVerify({:08X}, {:08X})", buffer_ptr, buffer_length);
+      return XStringVerify(buffer_ptr);
     }
     case 0x0005000C: {
       assert_true(!buffer_length ||
