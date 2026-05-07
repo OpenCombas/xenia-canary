@@ -150,13 +150,7 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
       kernel::object_ref<kernel::XHostThread>(new kernel::XHostThread(
           kernel_state_, 128 * 1024, 0,
           [this]() {
-            uint64_t normalized_framerate_limit =
-                std::max<uint64_t>(0, cvars::framerate_limit);
-
-            // If VSYNC is enabled, but frames are not limited,
-            // lock framerate at default value of 60
-            if (normalized_framerate_limit == 0 && cvars::vsync)
-              normalized_framerate_limit = 60;
+            uint64_t normalized_framerate_limit = 60;
 
             const double vsync_duration_d =
                 cvars::vsync

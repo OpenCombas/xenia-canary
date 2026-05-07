@@ -228,7 +228,7 @@ X_STATUS Emulator::Setup(
   // We could reset this with save state data/constant value to help replays.
   Clock::set_guest_system_time_base(Clock::QueryHostSystemTime());
   // This can be adjusted dynamically, as well.
-  Clock::set_guest_time_scalar(cvars::time_scalar);
+  Clock::set_guest_time_scalar(1);
 
   // Before we can set thread affinity we must enable the process to use all
   // logical processors.
