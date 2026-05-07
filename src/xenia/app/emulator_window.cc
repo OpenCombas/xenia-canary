@@ -859,15 +859,6 @@ bool EmulatorWindow::Initialize() {
   // CPU menu.
   auto cpu_menu = MenuItem::Create(MenuItem::Type::kPopup, "&CPU");
   {
-    cpu_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "&Reset Time Scalar", "Numpad *",
-        std::bind(&EmulatorWindow::CpuTimeScalarReset, this)));
-    cpu_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "Time Scalar /= 2", "Numpad -",
-        std::bind(&EmulatorWindow::CpuTimeScalarSetHalf, this)));
-    cpu_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, "Time Scalar *= 2", "Numpad +",
-        std::bind(&EmulatorWindow::CpuTimeScalarSetDouble, this)));
   }
 #if XE_OPTION_PROFILING
   cpu_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
@@ -1113,6 +1104,9 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     return;
   }
 
+  std::string notificationTitle = "";
+  std::string notificationDesc = "";
+
   switch (e.virtual_key()) {
     case ui::VirtualKey::kO: {
       if (!e.is_ctrl_pressed()) {
@@ -1120,22 +1114,16 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
       }
       FileOpen();
     } break;
-    case ui::VirtualKey::kMultiply: {
-      CpuTimeScalarReset();
-    } break;
-    case ui::VirtualKey::kSubtract: {
-      CpuTimeScalarSetHalf();
-    } break;
-    case ui::VirtualKey::kAdd: {
-      CpuTimeScalarSetDouble();
-    } break;
 
     case ui::VirtualKey::kF3: {
       Profiler::ToggleDisplay();
     } break;
 
     case ui::VirtualKey::kF4: {
-      GpuTraceFrame();
+      CycleReadbackResolve();
+      notificationTitle = "Toggle Readback Resolve";
+      const std::string& current = cvars::readback_resolve;
+      notificationDesc = current;
     } break;
     case ui::VirtualKey::kF5: {
       GpuClearCaches();
@@ -1195,6 +1183,14 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
 
     default:
       return;
+  }
+
+  if (!notificationTitle.empty()) {
+    app_context_.CallInUIThread(
+        [imgui_drawer = imgui_drawer(), notificationTitle, notificationDesc]() {
+          new xe::ui::HostNotificationWindow(imgui_drawer, notificationTitle,
+                                             notificationDesc, 0);
+        });
   }
 
   e.set_handled(true);
@@ -2004,20 +2000,6 @@ const std::map<int, EmulatorWindow::ControllerHotKey> controller_hotkey_map = {
          EmulatorWindow::ButtonFunctions::ToggleControllerVibration,
          "Left Shoulder + Guide = Toggle Controller Vibration", true)},
 
-    // CPU Time Scalar with no rumble feedback
-    {X_INPUT_GAMEPAD_DPAD_DOWN | X_INPUT_GAMEPAD_GUIDE,
-     EmulatorWindow::ControllerHotKey(
-         EmulatorWindow::ButtonFunctions::CpuTimeScalarSetHalf,
-         "D-PAD Down + Guide = Half CPU Scalar")},
-    {X_INPUT_GAMEPAD_DPAD_UP | X_INPUT_GAMEPAD_GUIDE,
-     EmulatorWindow::ControllerHotKey(
-         EmulatorWindow::ButtonFunctions::CpuTimeScalarSetDouble,
-         "D-PAD Up + Guide = Double CPU Scalar")},
-    {X_INPUT_GAMEPAD_DPAD_RIGHT | X_INPUT_GAMEPAD_GUIDE,
-     EmulatorWindow::ControllerHotKey(
-         EmulatorWindow::ButtonFunctions::CpuTimeScalarReset,
-         "D-PAD Right + Guide = Reset CPU Scalar")},
-
     // non-pass through hotkeys
     {X_INPUT_GAMEPAD_Y, EmulatorWindow::ControllerHotKey(
                             EmulatorWindow::ButtonFunctions::ToggleFullscreen,
@@ -2127,26 +2109,6 @@ EmulatorWindow::ControllerHotKey EmulatorWindow::ProcessControllerHotkey(
 
       // Extra Sleep
       xe::threading::Sleep(delay);
-      break;
-    case ButtonFunctions::CpuTimeScalarSetHalf:
-      CpuTimeScalarSetHalf();
-
-      notificationTitle = "Time Scalar";
-      notificationDesc =
-          fmt::format("Decreased to {}", Clock::guest_time_scalar());
-      break;
-    case ButtonFunctions::CpuTimeScalarSetDouble:
-      CpuTimeScalarSetDouble();
-
-      notificationTitle = "Time Scalar";
-      notificationDesc =
-          fmt::format("Increased to {}", Clock::guest_time_scalar());
-      break;
-    case ButtonFunctions::CpuTimeScalarReset:
-      CpuTimeScalarReset();
-
-      notificationTitle = "Time Scalar";
-      notificationDesc = fmt::format("Reset to {}", Clock::guest_time_scalar());
       break;
     case ButtonFunctions::ClearGPUCache:
       GpuClearCaches();
