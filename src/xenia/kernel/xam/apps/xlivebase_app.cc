@@ -90,10 +90,9 @@ X_HRESULT XLiveBaseApp::ExecuteDispatchMessage(uint32_t message,
     case 0x0005000A: {
       assert_true(!buffer_length ||
                   buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // 534507D4 - XStorageUploadFromMemory
-      // 4D5307D3, 415607F7, 584108F0, 5454082B, 545407F8, 575207FD
-      XELOGD("XStorageEnumerate({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return XStorageEnumerate(buffer_ptr);
+      XELOGD("XStorageUploadFromMemory({:08X}, {:08X})", buffer_ptr,
+             buffer_length);
+      return XStorageUploadFromMemory(buffer_ptr);
     }
     case 0x0005000B: {
       assert_true(!buffer_length ||
@@ -1978,7 +1977,7 @@ X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
   uint64_t xuid = 0;
 
   if (args->user_index == XUserIndexNone) {
-    xuid = args->xuid;
+    xuid = 0;
   }
 
   bool xuid_reqiured =
@@ -1986,10 +1985,7 @@ X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
       args->storage_location == X_STORAGE_FACILITY::FACILITY_GAME_CLIP;
 
   if (!xuid && xuid_reqiured) {
-    xuid = kernel_state()
-               ->xam_state()
-               ->GetUserProfile(args->user_index.get())
-               ->GetOnlineXUID();
+    xuid = 0;
   }
 
   uint8_t* filename_ptr =
