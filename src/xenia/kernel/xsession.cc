@@ -781,12 +781,12 @@ X_RESULT XSession::WriteStats(XGI_STATS_WRITE* data) {
   if (!HasSessionFlag(static_cast<SessionFlags>((uint32_t)local_details_.Flags),
                       STATS)) {
     XELOGW("Session does not support stats.");
-    return X_ERROR_FUNCTION_FAILED;
+    return X_ERROR_SUCCESS;
   }
 
   if (local_details_.eState != XSESSION_STATE::INGAME) {
     XELOGW("Writing stats outside of gameplay.");
-    return X_ERROR_FUNCTION_FAILED;
+    return X_ERROR_SUCCESS;
   }
 
   if (!data->num_views) {
@@ -842,10 +842,10 @@ X_RESULT XSession::WriteStats(XGI_STATS_WRITE* data) {
     // non-arbitrated session, then XSessionWriteStats will fail.
     if (IsTrueSkillViewID(view_id) && !is_arbitrated_session) {
       XELOGI("{} requires session arbitration", __func__);
-      return X_ONLINE_E_SESSION_REQUIRES_ARBITRATION;
+      return X_ERROR_SUCCESS;
     } else if (!is_arbitrated_session && is_view_arbitrated) {
       XELOGI("{} requires session arbitration", __func__);
-      return X_ONLINE_E_SESSION_REQUIRES_ARBITRATION;
+      return X_ERROR_SUCCESS;
     }
 
     const xam::XUSER_PROPERTY* properties_ptr =
