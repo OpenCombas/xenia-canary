@@ -1004,9 +1004,9 @@ dword_result_t XamParseGamerTileKey_entry(pointer_t<X_USER_DATA> key_ptr,
       kernel_memory()->TranslateVirtual<const char16_t*>(
           key_ptr->data.unicode.ptr)));
 
-  if (tile_key.empty() || tile_key.size() != sizeof(GamerPictureKey)) {
-    return X_ERROR_INVALID_PARAMETER;
-  }
+  //if (tile_key.empty() || tile_key.size() != sizeof(GamerPictureKey)) {
+  //  return X_ERROR_INVALID_PARAMETER;
+  //}
 
   const bool is_valid_hex_string =
       std::all_of(tile_key.cbegin(), tile_key.cend(),
@@ -1110,12 +1110,16 @@ dword_result_t XamReadTileToTextureEx_entry(
     } else if (user_index == XUserIndexNone) {
       // Remote user
 
-      xe::be<uint32_t> title_id = 0;
-      xe::be<uint32_t> big_tile_id = 0;
-      xe::be<uint32_t> small_tile_id = 0;
+      xe::be<uint32_t> title_id_ = 0;
+      xe::be<uint32_t> big_tile_id = static_cast<uint32_t>(tile_id);
+      xe::be<uint32_t> small_tile_id = static_cast<uint32_t>(tile_id);
 
-      XamParseGamerTileKey_entry(key_ptr, &title_id.value, &big_tile_id.value,
-                                 &small_tile_id.value);
+      if (key_ptr) {
+        XamParseGamerTileKey_entry(key_ptr, &title_id_.value,
+                                   &big_tile_id.value, &small_tile_id.value);
+      } else {
+        title_id_.value = title_id;
+      }
 
       const uint32_t gamerpic_id = fsmall ? small_tile_id : big_tile_id;
 
