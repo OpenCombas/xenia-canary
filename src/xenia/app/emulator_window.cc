@@ -75,7 +75,7 @@ DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
 DEFINE_bool(controller_hotkeys, false, "Hotkeys for Xbox and PS controllers.",
             "General");
 
-DEFINE_bool(auto_check_updates, true,
+DEFINE_bool(auto_check_updates, false,
             "Automatically check for updates on startup and notify if any are "
             "available.",
             "General");
