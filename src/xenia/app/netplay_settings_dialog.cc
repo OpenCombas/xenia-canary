@@ -91,44 +91,6 @@ void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
       ImGui::SetTooltip("Changing API address while playing isn't supported!");
     }
 
-    const std::string remove_api_desc = "Remove";
-
-    ImVec2 remove_api_lbl_size = ImGui::CalcTextSize(remove_api_desc.c_str());
-    ImVec2 remove_api_btn_size =
-        ImVec2(btn_width, remove_api_lbl_size.y + btn_height_padding);
-
-    const bool is_default =
-        selected_api_address_item_ == xlive_api->GetDefaultPublicServer();
-
-    ImGui::BeginDisabled(!updatable || is_default);
-    if (ImGui::Button(remove_api_desc.c_str(), remove_api_btn_size)) {
-      ImGui::OpenPopup("Remove API Address");
-    }
-    ImGui::EndDisabled();
-
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
-        !updatable) {
-      ImGui::SetTooltip("Cannot remove API address while playing!");
-    }
-
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
-        updatable && is_default) {
-      ImGui::SetTooltip("Cannot remove default API address!");
-    }
-
-    ImGui::SameLine();
-
-    const std::string add_api_desc = "Add";
-
-    ImVec2 add_api_lbl_size = ImGui::CalcTextSize(add_api_desc.c_str());
-    ImVec2 add_api_btn_size =
-        ImVec2(btn_width, add_api_lbl_size.y + btn_height_padding);
-
-    if (ImGui::Button(add_api_desc.c_str(), add_api_btn_size)) {
-      add_api_address_dialog_open_ = true;
-      ImGui::OpenPopup("API Addresses");
-    }
-
     ImGui::Spacing();
     ImGui::Separator();
 
