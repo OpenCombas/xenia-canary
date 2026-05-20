@@ -115,6 +115,12 @@ dword_result_t XamQueryLiveHiveA_entry(
       value = "1";
     } else if (feature_name.value() == "TFAEnabled") {
       value = "1";
+    } else if (feature_name.value() == "CatalogUriRoot") {
+      value = "http://catalog.xboxlive.com";
+    } else if (feature_name.value() == "CatalogCDNUriRoot") {
+      value = "http://catalog-cdn.xboxlive.com";
+    } else if (feature_name.value() == "CatalogCDNUriPort") {
+      value = "80";
     } else {
       assert_always();
       XELOGI("Unknown Feature: {}", feature_name.value());
