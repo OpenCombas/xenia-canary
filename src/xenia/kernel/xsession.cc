@@ -972,19 +972,18 @@ X_RESULT XSession::GetSessions(KernelState* kernel_state,
     return X_ONLINE_E_SESSION_INSUFFICIENT_BUFFER;
   }
 
-    xam::XUSER_CONTEXT* search_contexts_ptr =
+  xam::XUSER_CONTEXT* search_contexts_ptr =
       kernel_state->memory()->TranslateVirtual<xam::XUSER_CONTEXT*>(
           search_data->ctx_ptr);
 
   xam::XUSER_PROPERTY* search_properties_ptr =
-        kernel_state->memory()->TranslateVirtual<xam::XUSER_PROPERTY*>(
+      kernel_state->memory()->TranslateVirtual<xam::XUSER_PROPERTY*>(
           search_data->props_ptr);
 
   const auto sessions =
       kernel_state->GetXboxLiveAPI()->SessionSearch(search_data, num_users);
 
-   std::vector<uint32_t> filtered_indices;
-
+  std::vector<uint32_t> filtered_indices;
 
   if (!kernel_state->emulator()->game_info_database()->HasXLast() &&
       (search_data->num_ctx > 0 || search_data->num_props > 0)) {
@@ -995,23 +994,26 @@ X_RESULT XSession::GetSessions(KernelState* kernel_state,
       xe::be<uint16_t> ctx_match = 0;
 
       const auto all_properties =
-          kernel_state->GetXboxLiveAPI() ->SessionPropertiesGet(sessions.at(i)->SessionID_UInt());
+          kernel_state->GetXboxLiveAPI()->SessionPropertiesGet(
+              sessions.at(i)->SessionID_UInt());
       for (const auto& property : all_properties) {
         if (property.IsContext()) {
           for (uint32_t i = 0; i < search_data->num_ctx; i++) {
             if ((search_contexts_ptr[i].context_id ==
-                property.GetPropertyId().value) && 
+                 property.GetPropertyId().value) &&
                 (search_contexts_ptr[i].value ==
                  property.get_data()->data.u32)) {
               ctx_match++;
             }
           }
         } else {
-          for (uint32_t i = 0; i < search_data->num_ctx; i++) {
-            if (search_properties_ptr[i].property_id ==
-                    property.GetPropertyId().value &&
-                (search_properties_ptr[i].data.data.u32 ==
-                 property.get_data()->data.u32)) {
+          for (uint32_t i = 0; i < search_data->num_props; i++) {
+            const uint32_t search_property_data =
+                search_properties_ptr[i].data.data.u32.get();
+            const uint32_t search_property_id =
+                search_properties_ptr[i].property_id.get();
+            if (search_property_id == property.GetPropertyId().value &&
+                (search_property_data == property.get_data()->data.u32)) {
               props_match++;
             }
           }
@@ -1028,24 +1030,22 @@ X_RESULT XSession::GetSessions(KernelState* kernel_state,
       static_cast<uint32_t>(sessions.size() - filtered_indices.size()));
 
   XELOGI("Found {} sessions. Filtered {} sessions.",
-         session_count + filtered_indices.size(),
-         session_count);
+         session_count + filtered_indices.size(), session_count);
   const uint32_t session_ids =
       kernel_state->memory()->SystemHeapAlloc(session_count * sizeof(XNKID));
 
   XNKID* session_ids_ptr =
       kernel_state->memory()->TranslateVirtual<XNKID*>(session_ids);
 
-   for (uint32_t i = 0; i < session_count + filtered_indices.size(); i++) {
+  for (uint32_t i = 0; i < session_count + filtered_indices.size(); i++) {
     XNKID id = {};
-     if (std::find(filtered_indices.begin(), filtered_indices.end(), i) ==
-         filtered_indices.end()){
-        Uint64toXNKID(sessions.at(i)->SessionID_UInt(), &id);
-        session_ids_ptr[i] = id;
+    if (std::find(filtered_indices.begin(), filtered_indices.end(), i) ==
+        filtered_indices.end()) {
+      Uint64toXNKID(sessions.at(i)->SessionID_UInt(), &id);
+      session_ids_ptr[i] = id;
     }
   }
-   GetSessionByIDs(kernel_state, session_ids_ptr,
-                  session_count,
+  GetSessionByIDs(kernel_state, session_ids_ptr, session_count,
                   search_data->search_results_ptr,
                   search_data->results_buffer_size);
 
