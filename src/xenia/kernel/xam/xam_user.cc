@@ -1004,9 +1004,9 @@ dword_result_t XamParseGamerTileKey_entry(pointer_t<X_USER_DATA> key_ptr,
       kernel_memory()->TranslateVirtual<const char16_t*>(
           key_ptr->data.unicode.ptr)));
 
-  //if (tile_key.empty() || tile_key.size() != sizeof(GamerPictureKey)) {
-  //  return X_ERROR_INVALID_PARAMETER;
-  //}
+  // if (tile_key.empty() || tile_key.size() != sizeof(GamerPictureKey)) {
+  //   return X_ERROR_INVALID_PARAMETER;
+  // }
 
   const bool is_valid_hex_string =
       std::all_of(tile_key.cbegin(), tile_key.cend(),
