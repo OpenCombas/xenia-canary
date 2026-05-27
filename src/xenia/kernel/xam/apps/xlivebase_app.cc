@@ -1886,19 +1886,9 @@ X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
 
   uint64_t xuid = 0;
 
-  if (args->user_index == XUserIndexNone) {
-    xuid = args->xuid;
-  }
-
   bool xuid_reqiured =
       args->storage_location == X_STORAGE_FACILITY::FACILITY_PER_USER_TITLE ||
       args->storage_location == X_STORAGE_FACILITY::FACILITY_GAME_CLIP;
-
-  if (!xuid && xuid_reqiured) {
-    xuid = kernel_state_->xam_state()
-               ->GetUserProfile(args->user_index.get())
-               ->GetOnlineXUID();
-  }
 
   uint8_t* filename_ptr =
       memory_->TranslateVirtual<uint8_t*>(args->file_name_ptr);
