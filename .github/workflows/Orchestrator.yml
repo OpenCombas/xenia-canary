@@ -72,19 +72,19 @@ jobs:
   # Stage 3: Release
   # ===========================================================================
   # Uncomment when nightly releases is ready:
-  # release:
-  #   name: Create Release
-  #   needs: [build-windows, build-linux]
-  #   if: |
-  #     always() &&
-  #     github.repository == 'xenia-canary/xenia-canary' &&
-  #     github.event_name == 'push' &&
-  #     github.ref == 'refs/heads/canary_experimental' &&
-  #     (needs.build-windows.result == 'success' && needs.build-linux.result == 'success')
-  #   uses: ./.github/workflows/Create_release.yml
-  #   permissions:
-  #     contents: write
-  #   secrets: inherit
-  #   with:
-  #     tag: ${{ github.sha }}
-  #     branch: ${{ github.ref_name }}
+  release:
+    name: Create Release
+    needs: [build-windows]
+    if: |
+      always() &&
+      github.repository == 'OpenCombas/xenia-canary' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/xenia_netplay_opencombas' &&
+      (needs.build-windows.result == 'success')
+    uses: ./.github/workflows/Create_release.yml
+    permissions:
+      contents: write
+    secrets: inherit
+    with:
+      tag: ${{ github.sha }}
+      branch: ${{ github.ref_name }}
