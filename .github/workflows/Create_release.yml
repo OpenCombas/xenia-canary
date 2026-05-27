@@ -8,10 +8,10 @@ on:
         required: true
         type: string
       branch:
-        description: 'Branch name used as release tag suffix (e.g. canary_experimental)'
+        description: 'Branch name used as release tag suffix (e.g. xenia_netplay_opencombas)'
         required: false
         type: string
-        default: 'canary_experimental'
+        default: 'xenia_netplay_opencombas'
 
 jobs:
   release:
@@ -84,14 +84,14 @@ jobs:
       - name: Download Windows artifacts
         uses: actions/download-artifact@v8
         with:
-          name: xenia_canary_windows
-          path: artifacts/windows/xenia_canary
+          name: xenia_canary_netplay_windows
+          path: artifacts/xenia
 
-      - name: Download Linux artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: xenia_canary_linux
-          path: artifacts/linux
+      # - name: Download Linux artifacts
+      #   uses: actions/download-artifact@v8
+      #   with:
+      #     name: xenia_canary_linux
+      #     path: artifacts/linux
 
       # Uncomment when platforms are enabled:
       # - name: Download macOS artifacts
@@ -113,26 +113,11 @@ jobs:
           mkdir -p release_assets
 
           # Windows
-          if [ -d "artifacts/windows/xenia_canary" ]; then
-            cd artifacts/windows/xenia_canary
-            zip -r ../../../release_assets/xenia_canary_windows.zip . -x "*.pdb"
+          if [ -d "artifacts/xenia" ]; then
+            cd artifacts/xenia
+            zip -r ../../../release_assets/xenia.zip . -x "*.pdb"
             cd ../../..
           fi
-
-          # Linux AppImage
-          if [ -f "artifacts/linux/xenia_canary_linux.AppImage" ]; then
-            cp artifacts/linux/xenia_canary_linux.AppImage release_assets/
-          fi
-
-          # macOS (uncomment when enabled)
-          # if [ -f "artifacts/macos/xenia_canary_macos.tar.gz" ]; then
-          #   cp artifacts/macos/xenia_canary_macos.tar.gz release_assets/
-          # fi
-
-          # Android (uncomment when enabled)
-          # if [ -f "artifacts/android/xenia_canary_android.zip" ]; then
-          #   cp artifacts/android/xenia_canary_android.zip release_assets/
-          # fi
 
           echo "=== Release assets ==="
           ls -lh release_assets/
