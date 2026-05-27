@@ -115,8 +115,8 @@ jobs:
           # Windows
           if [ -d "artifacts/xenia" ]; then
             cd artifacts/xenia
-            zip -r ../../../release_assets/xenia.zip . -x "*.pdb"
-            cd ../../..
+            zip -r ../../release_assets/xenia.zip . -x "*.pdb"
+            cd ../..
           fi
 
           echo "=== Release assets ==="
