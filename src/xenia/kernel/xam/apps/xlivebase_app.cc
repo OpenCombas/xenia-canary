@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2025 Xenia Canary. All rights reserved.                          *
+ * Copyright 2026 Xenia Canary. All rights reserved.                          *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -16,6 +16,7 @@
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/unmarshaller/generic_unmarshaller.h"
+#include "xenia/kernel/xam/unmarshaller/schema_in_memory.h"
 #include "xenia/kernel/xam/unmarshaller/xaccount_getuserinfo_unmarshaller.h"
 #include "xenia/kernel/xam/unmarshaller/xinvite_send_unmarshaller.h"
 #include "xenia/kernel/xam/unmarshaller/xlivebase_task.h"
@@ -42,10 +43,67 @@ namespace kernel {
 namespace xam {
 namespace apps {
 
-// TODO(Adrian): Determine the correct function during runtime, the schema index
-// can change depending on schema data version.
+// Deleted XOnline Functions
+// GenresEnumerate (Blades) - 0x00050090
+// EnumerateTitlesByFilter (Blades) - 0x00050091
+//
+// These functions no longer exist in the latest online schema, their ordinals
+// are not found. Blades likely wouldn't run on the latest version of XAM which
+// includes the latest online schema. Therefore this usually wouldn't be an
+// issue.
+//
+// We would need to support multiple versions of XLiveBase/online schema to fix
+// this issue. Currently these message IDs do not conflict with any known usage
+// therefore we can retain the functionality for now.
+// Alternatively we could rely on the ordinal for async tasks instead of message
+// ID?
+
 XLiveBaseApp::XLiveBaseApp(KernelState* kernel_state)
     : App(kernel_state, 0xFC) {}
+
+// Convert message ID to latest online schema.
+uint32_t XLiveBaseApp::GetDispatchMessageID(uint32_t message,
+                                            uint32_t buffer_ptr,
+                                            uint32_t buffer_length) const {
+  if (buffer_length != sizeof(XLIVEBASE_ASYNC_MESSAGE)) {
+    return message;
+  }
+
+  SchemaInMemory schema;
+  schema.Bind(kernel_state()->xam_state()->GetOnlineSchemaAddress());
+
+  GenericUnmarshaller unmarshaller(buffer_ptr);
+  XLivebaseAsyncTask task = unmarshaller.GetAsyncTask();
+  SchemaInMemory title_schema = task.GetTitleSchema();
+
+  const std::string function_name =
+      schema.GetOrdinalFunctionName(task.GetXLiveAsyncTask()->ordinal);
+
+  XELOGD("{}({:08X}, {:08X})",
+         function_name.empty() ? "Unknown" : function_name, buffer_ptr,
+         buffer_length);
+
+  // If title (Dashboard/Avatar Editor) loads schema via XamGetOnlineSchema then
+  // version will match.
+  if (title_schema.SchemaVersion() == schema.SchemaVersion()) {
+    return message;
+  }
+
+  uint16_t new_schema_index = 0;
+  bool found = schema.XLookupSchemaIndexFromOrdinal(
+      task.GetXLiveAsyncTask()->ordinal, &new_schema_index);
+
+  const uint32_t message_id =
+      found ? new_schema_index | kAsyncSchemaIndexMask : message;
+
+  if (!found) {
+    XELOGI("XLiveBase ordinal not found: {:04X}",
+           task.GetXLiveAsyncTask()->ordinal.get());
+    assert_always();
+  }
+
+  return message_id;
+}
 
 /// <param name="buffer_ptr"> - Generic param1 could be anything.</param>
 /// <param name="buffer_length"> - Generic param2 could be anything.</param>
@@ -56,179 +114,87 @@ X_HRESULT XLiveBaseApp::ExecuteDispatchMessage(uint32_t message,
   // NOTE: buffer_length may be zero or valid.
   uint8_t* buffer = memory_->TranslateVirtual<uint8_t*>(buffer_ptr);
 
-  switch (message) {
+  const uint32_t message_id =
+      GetDispatchMessageID(message, buffer_ptr, buffer_length);
+
+  switch (message_id) {
     case 0x00050002: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("XInviteSend({:08X}, {:08X})", buffer_ptr, buffer_length);
       return XInviteSend(buffer_ptr);
     }
     case 0x00050008: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // Default to XStorageDownloadToMemory instead of XStorageDelete since
-      // it's used more.
-
-      // 534507D4, 555307D7, 545107D1 - XStorageDownloadToMemory
-      XELOGD("XStorageDownloadToMemory({:08X}, {:08X})", buffer_ptr,
-             buffer_length);
-      return XStorageDownloadToMemory(buffer_ptr, extended_error);
-
-      // XELOGD("XStorageDelete({:08X}, {:08X})", buffer_ptr, buffer_length);
-      // return XStorageDelete(buffer_ptr);
+      return XStorageDelete(buffer_ptr);
     }
     case 0x00050009: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // 555307D7 - XStorageEnumerate
-      XELOGD("XStorageDownloadToMemory({:08X}, {:08X})", buffer_ptr,
-             buffer_length);
+      // 534507D4, 555307D7, 545107D1
       return XStorageDownloadToMemory(buffer_ptr, extended_error);
     }
     case 0x0005000A: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // 534507D4 - XStorageUploadFromMemory
-      // 4D5307D3, 415607F7, 584108F0, 5454082B, 545407F8, 575207FD
-      XELOGD("XStorageEnumerate({:08X}, {:08X})", buffer_ptr, buffer_length);
+      // 4D5307D3, 415607F7, 584108F0, 5454082B, 545407F8, 575207FD, 555307D7
       return XStorageEnumerate(buffer_ptr);
     }
     case 0x0005000B: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // 43430821
-      XELOGD("XStorageUploadFromMemory({:08X}, {:08X})", buffer_ptr,
-             buffer_length);
+      // 43430821, 4E4D07D3
       return XStorageUploadFromMemory(buffer_ptr);
     }
     case 0x0005000C: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // 454107F1 - XAccountGetUserInfo
-      // 4E4D07D3 - XStorageUploadFromMemory (-1 schema index offset)
-      // 57520829, 4156081C - XStringVerify (+1 schema index offset)
-      XELOGD("GenericTask({:08X} {:08X})", buffer_ptr, buffer_length);
-      return GenericMarshalled(buffer_ptr);
+      // 57520829, 4156081C, 415607D2
+      return XStringVerify(buffer_ptr);
     }
     case 0x0005000D: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // Usually XStringVerify
       // 4D5307EA, 58410889 - XUserEstimateRankForRating
-      XELOGD("GenericTask({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return GenericMarshalled(buffer_ptr);
+      return XUserEstimateRankForRating(buffer_ptr);
     }
     case 0x0005000E: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("XUserFindUsers({:08X}, {:08X})", buffer_ptr, buffer_length);
+      // 584113E8
       return XUserFindUsers(buffer_ptr);
     }
     case 0x0005000F: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("XAccountGetUserInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
+      // 454107DB, 4D530AA5, 454107F1
       return XAccountGetUserInfo(buffer_ptr);
     }
-    case 0x00050010: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("XAccountGetUserInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return XAccountGetUserInfo(buffer_ptr);
-    }
-    case 0x00050036: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // 534507D4
-      XELOGD("XOnlineQuerySearch({:08X}, {:08X})", buffer_ptr, buffer_length);
+    case 0x0005006E: {
+      // 4D5307D3, 4D5307D1, 545407E2, 545407E3, 545407D2, 545407D3, 534507D4
       return XOnlineQuerySearch(buffer_ptr);
-    }
-    case 0x00050038: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // 4D5307D3, 4D5307D1, 545407E2, 545407E3, 545407D2, 545407D3
-      XELOGD("XOnlineQuerySearch({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return XOnlineQuerySearch(buffer_ptr);
-    }
-    case 0x00050077: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("XAccountGetPointsBalance({:08X}, {:08X})", buffer_ptr,
-             buffer_length);
-      return XAccountGetPointsBalance(buffer_ptr);
-    }
-    case 0x00050079: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // 454107DB
-      XELOGD("XAccountGetUserInfo({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return XAccountGetUserInfo(buffer_ptr);
-    }
-    case 0x0005008B: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("GetBannerListHot({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return GetBannerListHot(buffer_ptr);
-    }
-    case 0x0005008C: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("GetBannerList({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return GetBannerList(buffer_ptr);
-    }
-    case 0x0005008F: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("ContentEnumerate({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return ContentEnumerate(buffer_ptr);
     }
     case 0x00050090: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("GenresEnumerate({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return GenresEnumerate(buffer_ptr);
+      // Deleted XOnline Function
+      XELOGD("XGenresEnumerate({:08X}, {:08X})", buffer_ptr, buffer_length);
+      return XGenresEnumerate(buffer_ptr);
     }
     case 0x00050091: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("EnumerateTitlesByFilter({:08X}, {:08X})", buffer_ptr,
+      // Deleted XOnline Function
+      XELOGD("XEnumerateTitlesByFilter({:08X}, {:08X})", buffer_ptr,
              buffer_length);
-      return EnumerateTitlesByFilter(buffer_ptr);
+      return XEnumerateTitlesByFilter(buffer_ptr);
     }
-    case 0x00050094: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      // Called on startup of blades dashboard v4532 to v4552
-      XELOGD("XLiveBaseUnk50094({:08X}, {:08X}) Stubbed", buffer_ptr,
-             buffer_length);
-      return GenericMarshalled(buffer_ptr);
+    case 0x000500C6: {
+      return XAccountGetPointsBalance(buffer_ptr);
     }
-    case 0x00050097: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("SubscriptionEnumerate({:08X}, {:08X})", buffer_ptr,
-             buffer_length);
-      return SubscriptionEnumerate(buffer_ptr);
+    case 0x000500F7: {
+      return XOfferingContentEnumerate(buffer_ptr);
     }
-    case 0x00050108: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("XUserValidateAvatarManifest({:08X}, {:08X})", buffer_ptr,
-             buffer_length);
-      return GenericMarshalled(buffer_ptr);
+    case 0x000500FE: {
+      return XGetBannerList(buffer_ptr);
+    }
+    case 0x000500FF: {
+      return XGetBannerListHot(buffer_ptr);
+    }
+    case 0x00050104: {
+      return XOfferingSubscriptionEnumerate(buffer_ptr);
     }
     case 0x0005012B: {
-      assert_true(!buffer_length ||
-                  buffer_length == sizeof(XLIVEBASE_ASYNC_MESSAGE));
-      XELOGD("XUserValidateAvatarManifest({:08X}, {:08X})", buffer_ptr,
-             buffer_length);
-      return GenericMarshalled(buffer_ptr);
+      return XUserValidateAvatarManifest(buffer_ptr);
     }
     case 0x00058003: {
       assert_true(!buffer_ptr || !buffer_length);
       // Called on startup of dashboard
       XELOGD("XLiveBaseLogonGetHR({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return X_ONLINE_S_LOGON_CONNECTION_ESTABLISHED;
+      const uint32_t live_connection_state =
+          cvars::network_mode == NETWORK_MODE::XBOXLIVE
+              ? X_ONLINE_S_LOGON_CONNECTION_ESTABLISHED
+              : X_ONLINE_S_LOGON_DISCONNECTED;
+
+      return live_connection_state;
     }
     case 0x00058004: {
       assert_true(!buffer_length || buffer_length == sizeof(uint32_t));
@@ -428,10 +394,6 @@ X_HRESULT XLiveBaseApp::XPresenceSubscribe(uint32_t buffer_ptr,
           static_cast<uint32_t>(subscribe_args->peers.argument_value_ptr)));
 
   if (!kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
-    return X_E_INVALIDARG;
-  }
-
-  if (num_peers <= 0) {
     return X_E_INVALIDARG;
   }
 
@@ -679,7 +641,7 @@ X_HRESULT XLiveBaseApp::XOnlineQuerySearch(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XQuerySearchUnmarshaller unmarshaller = XQuerySearchUnmarshaller(buffer_ptr);
+  XQuerySearchUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -970,7 +932,7 @@ X_HRESULT XLiveBaseApp::XInviteSend(uint32_t buffer_ptr) {
 
   // Current session must have PRESENCE flag.
 
-  XInviteSendUnmarshaller unmarshaller = XInviteSendUnmarshaller(buffer_ptr);
+  XInviteSendUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -1079,35 +1041,9 @@ X_HRESULT XLiveBaseApp::GenericMarshalled(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  GenericUnmarshaller unmarshaller = GenericUnmarshaller(buffer_ptr);
+  GenericUnmarshaller unmarshaller(buffer_ptr);
 
-  const std::string_view task_url = unmarshaller.GetAsyncTask().GetTaskUrl();
-
-  // Determine function via it's URL, some functions don't have a URL if the url
-  // index is 0.
-  const std::string_view string_verify_url = "/msgserver/vetstring2.ashx";
-  const std::string_view account_get_user_info_url =
-      "/xuacs/XeGetUserInfo.ashx";
-  const std::string_view estimate_rank_for_rating_url =
-      "/xstats/xstatestimaterankforratings.ashx";
-  const std::string_view validate_avatar_manifest =
-      "/xstats/validateavatarmanifest.ashx";
-
-  if (string_verify_url == task_url) {
-    return XStringVerify(buffer_ptr);
-  }
-
-  if (account_get_user_info_url == task_url) {
-    return XAccountGetUserInfo(buffer_ptr);
-  }
-
-  if (estimate_rank_for_rating_url == task_url) {
-    return XUserEstimateRankForRating(buffer_ptr);
-  }
-
-  if (validate_avatar_manifest == task_url) {
-    return XUserValidateAvatarManifest(buffer_ptr);
-  }
+  const std::string task_url = unmarshaller.GetAsyncTask().GetTaskUrl();
 
   XELOGI("{}:: URL: {}", __func__, task_url);
 
@@ -1227,8 +1163,7 @@ X_HRESULT XLiveBaseApp::XAccountGetUserInfo(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XAccountGetUserInfoUnmarshaller unmarshaller =
-      XAccountGetUserInfoUnmarshaller(buffer_ptr);
+  XAccountGetUserInfoUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -1286,8 +1221,7 @@ X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XStorageEnumerateUnmarshaller unmarshaller =
-      XStorageEnumerateUnmarshaller(buffer_ptr);
+  XStorageEnumerateUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -1564,8 +1498,7 @@ X_HRESULT XLiveBaseApp::XStringVerify(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XStringVerifyUnmarshaller unmarshaller =
-      XStringVerifyUnmarshaller(buffer_ptr);
+  XStringVerifyUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -1605,8 +1538,7 @@ X_HRESULT XLiveBaseApp::XUserEstimateRankForRating(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XUserEstimateRankForRatingUnmarshaller unmarshaller =
-      XUserEstimateRankForRatingUnmarshaller(buffer_ptr);
+  XUserEstimateRankForRatingUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -1650,8 +1582,7 @@ X_HRESULT XLiveBaseApp::XStorageDelete(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XStorageDeleteUnmarshaller unmarshaller =
-      XStorageDeleteUnmarshaller(buffer_ptr);
+  XStorageDeleteUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -1713,8 +1644,7 @@ X_HRESULT XLiveBaseApp::XStorageDownloadToMemory(uint32_t buffer_ptr,
     return X_E_INVALIDARG;
   }
 
-  XStorageDownloadToMemoryUnmarshaller unmarshaller =
-      XStorageDownloadToMemoryUnmarshaller(buffer_ptr);
+  XStorageDownloadToMemoryUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -1857,8 +1787,7 @@ X_HRESULT XLiveBaseApp::XStorageUploadFromMemory(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XStorageUploadToMemoryUnmarshaller unmarshaller =
-      XStorageUploadToMemoryUnmarshaller(buffer_ptr);
+  XStorageUploadToMemoryUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -2252,8 +2181,7 @@ X_HRESULT XLiveBaseApp::XUserFindUsers(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  XUserFindUsersUnmarshaller unmarshaller =
-      XUserFindUsersUnmarshaller(buffer_ptr);
+  XUserFindUsersUnmarshaller unmarshaller(buffer_ptr);
 
   X_HRESULT deserialize_result = unmarshaller.Deserialize();
 
@@ -2424,7 +2352,7 @@ X_HRESULT XLiveBaseApp::XAccountGetPointsBalance(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  GenericUnmarshaller unmarshaller = GenericUnmarshaller(buffer_ptr);
+  GenericUnmarshaller unmarshaller(buffer_ptr);
 
   XACCOUNT_GET_POINTS_BALANCE_REQUEST* points_balance_request_ptr =
       unmarshaller
@@ -2448,11 +2376,11 @@ X_HRESULT XLiveBaseApp::XAccountGetPointsBalance(uint32_t buffer_ptr) {
   return X_E_SUCCESS;
 }
 
-X_HRESULT XLiveBaseApp::GetBannerList(uint32_t buffer_ptr) {
+X_HRESULT XLiveBaseApp::XGetBannerList(uint32_t buffer_ptr) {
   // Called on startup of blades dashboard v1888 to v2858
   // Address: 92433DA8
 
-  GenericUnmarshaller unmarshaller = GenericUnmarshaller(buffer_ptr);
+  GenericUnmarshaller unmarshaller(buffer_ptr);
 
   GET_BANNER_LIST_REQUEST* banner_list_request_ptr =
       unmarshaller.DeserializeReinterpret<GET_BANNER_LIST_REQUEST>();
@@ -2473,7 +2401,7 @@ X_HRESULT XLiveBaseApp::GetBannerList(uint32_t buffer_ptr) {
   return X_E_SUCCESS;
 }
 
-X_HRESULT XLiveBaseApp::GetBannerListHot(uint32_t buffer_ptr) {
+X_HRESULT XLiveBaseApp::XGetBannerListHot(uint32_t buffer_ptr) {
   // Blades Dashboard v1888
 
   // Fixes accessing marketplace Featured Downloads.
@@ -2483,7 +2411,7 @@ X_HRESULT XLiveBaseApp::GetBannerListHot(uint32_t buffer_ptr) {
     return X_E_INVALIDARG;
   }
 
-  GenericUnmarshaller unmarshaller = GenericUnmarshaller(buffer_ptr);
+  GenericUnmarshaller unmarshaller(buffer_ptr);
 
   GET_BANNER_LIST_REQUEST* banner_list_request =
       unmarshaller.DeserializeReinterpret<GET_BANNER_LIST_REQUEST>();
@@ -2504,7 +2432,7 @@ X_HRESULT XLiveBaseApp::GetBannerListHot(uint32_t buffer_ptr) {
   return X_E_SUCCESS;
 }
 
-X_HRESULT XLiveBaseApp::ContentEnumerate(uint32_t buffer_ptr) {
+X_HRESULT XLiveBaseApp::XOfferingContentEnumerate(uint32_t buffer_ptr) {
   // Blades Dashboard v1888
 
   // Fixes accessing marketplace sub menus:
@@ -2512,7 +2440,7 @@ X_HRESULT XLiveBaseApp::ContentEnumerate(uint32_t buffer_ptr) {
   // More Videos and Downloads
   // Address: 92433FA8
 
-  GenericUnmarshaller unmarshaller = GenericUnmarshaller(buffer_ptr);
+  GenericUnmarshaller unmarshaller(buffer_ptr);
 
   CONTENT_ENUMERATE_REQUEST* content_enumerate_request_ptr =
       unmarshaller.DeserializeReinterpret<CONTENT_ENUMERATE_REQUEST>();
@@ -2580,12 +2508,12 @@ X_HRESULT XLiveBaseApp::ContentEnumerate(uint32_t buffer_ptr) {
   return X_E_SUCCESS;
 }
 
-X_HRESULT XLiveBaseApp::GenresEnumerate(uint32_t buffer_ptr) {
+X_HRESULT XLiveBaseApp::XGenresEnumerate(uint32_t buffer_ptr) {
   // Fixes accessing marketplace Game Downloads->All Games->Xbox Live Arcade
   // sub menu.
   // Address: 92434218
 
-  GenericUnmarshaller unmarshaller = GenericUnmarshaller(buffer_ptr);
+  GenericUnmarshaller unmarshaller(buffer_ptr);
 
   GENRES_ENUMERATE_REQUEST* genre_enumerate_request_ptr =
       unmarshaller.DeserializeReinterpret<GENRES_ENUMERATE_REQUEST>();
@@ -2662,13 +2590,13 @@ X_HRESULT XLiveBaseApp::GenresEnumerate(uint32_t buffer_ptr) {
   return X_E_SUCCESS;
 }
 
-X_HRESULT XLiveBaseApp::EnumerateTitlesByFilter(uint32_t buffer_ptr) {
+X_HRESULT XLiveBaseApp::XEnumerateTitlesByFilter(uint32_t buffer_ptr) {
   // Blades Dashboard v1888
 
   // Fixes accessing marketplace Game Downloads.
   // Address: 92434468
 
-  GenericUnmarshaller unmarshaller = GenericUnmarshaller(buffer_ptr);
+  GenericUnmarshaller unmarshaller(buffer_ptr);
 
   ENUMERATE_TITLES_BY_FILTER* enumerate_titles_request_ptr =
       unmarshaller.DeserializeReinterpret<ENUMERATE_TITLES_BY_FILTER>();
@@ -2772,11 +2700,11 @@ X_HRESULT XLiveBaseApp::EnumerateTitlesByFilter(uint32_t buffer_ptr) {
   return X_E_SUCCESS;
 }
 
-X_HRESULT XLiveBaseApp::SubscriptionEnumerate(uint32_t buffer_ptr) {
+X_HRESULT XLiveBaseApp::XOfferingSubscriptionEnumerate(uint32_t buffer_ptr) {
   // Fixes accessing marketplace Memberships.
   // Address: 924346C0
 
-  GenericUnmarshaller unmarshaller = GenericUnmarshaller(buffer_ptr);
+  GenericUnmarshaller unmarshaller(buffer_ptr);
 
   SUBSCRIPTION_ENUMERATE_REQUEST* subscription_enumerate_ptr =
       unmarshaller.DeserializeReinterpret<SUBSCRIPTION_ENUMERATE_REQUEST>();

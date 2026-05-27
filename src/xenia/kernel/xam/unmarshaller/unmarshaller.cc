@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2025 Xenia Canary. All rights reserved.                          *
+ * Copyright 2026 Xenia Canary. All rights reserved.                          *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -13,8 +13,7 @@ namespace xe {
 namespace kernel {
 namespace xam {
 
-Unmarshaller::Unmarshaller(uint32_t marshaller_address)
-    : xlivebase_async_message_ptr_(nullptr), async_task_(0), position_(0) {
+Unmarshaller::Unmarshaller(uint32_t marshaller_address) : async_task_(0) {
   if (!marshaller_address) {
     return;
   }
