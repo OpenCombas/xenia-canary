@@ -79,7 +79,8 @@ jobs:
             exit 1
           }
           robocopy . build\bin\Windows\Release                                                             LICENSE /r:0 /w:0
-          robocopy   build\bin\Windows\Release artifacts\xenia_canary_netplay   xenia_canary_netplay.exe   LICENSE /r:0 /w:0
+          robocopy   build\bin\Windows\Release artifacts\xenia   xenia_canary_netplay.exe   LICENSE /r:0 /w:0
+          robocopy resources\ artifacts\xenia /E /r:0 /w:0
           If ($LastExitCode -le 7) { echo "LastExitCode = $LastExitCode";$LastExitCode = 0 }
 
       - name: Upload Xenia Canary artifact
@@ -87,6 +88,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: xenia_canary_netplay_windows
-          path: artifacts\xenia_canary_netplay
+          path: artifacts\xenia
           if-no-files-found: error
           retention-days: 7

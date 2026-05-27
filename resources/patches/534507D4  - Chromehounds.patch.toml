@@ -1,0 +1,35 @@
+title_name = "Chromegounds" # 2006
+title_id = "534507D4" # SE-2006
+hash = "EC12F1293810BF8F" # Release.xex
+#media_id = "00000000"
+
+[[patch]]
+    name = "reference sane memory region"
+    desc = "reference sane memory region"
+    author = "imaginebeingatcomputers"
+    is_enabled = true
+
+    [[patch.be32]]
+        address = 0x82770778
+        value = 0x3d2082a0
+
+[[patch]]
+    name = "leave the loop"
+    desc = "leave the loop"
+    author = "imaginebeingatcomputers"
+    is_enabled = true
+
+    [[patch.be32]]
+        address = 0x8244ca70
+        value = 0x60000000
+
+
+[[patch]]
+    name = "leave the loop2"
+    desc = "leave the loop2"
+    author = "imaginebeingatcomputers"
+    is_enabled = true
+
+    [[patch.be32]]
+        address = 0x82441e30
+        value = 0x60000000
