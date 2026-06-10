@@ -646,10 +646,10 @@ std::string GDBStub::RegisterWrite(const std::string& data) {
 }
 
 std::string GDBStub::RegisterReadAll() {
-  auto* thread = cache_.cur_thread_info();
-  if (!thread) {
-    return kGdbReplyError;
+  if (!cache_.cur_thread_info()) {
+    cache_.cur_thread_id = emulator_->main_thread_id();
   }
+  auto* thread = cache_.cur_thread_info();
   std::string result;
   result.reserve((39 * 8) + (32 * 16));
   for (int i = 0; i < 71; ++i) {
@@ -1129,10 +1129,10 @@ std::string GDBStub::HandleGDBCommand(GDBClient& client,
           {"qC",
            [&](const GDBCommand& cmd) {
              std::unique_lock<std::mutex> lock(mtx_);
-             auto* thread = cache_.cur_thread_info();
-             if (!thread) {
-               return std::string(kGdbReplyError);
+             if (!cache_.cur_thread_info()) {
+               cache_.cur_thread_id = emulator_->main_thread_id();
              }
+             auto* thread = cache_.cur_thread_info();
              return "QC" + std::to_string(thread->thread_id);
            }},
           // Set current debugger thread ID
@@ -1209,7 +1209,9 @@ std::string GDBStub::HandleGDBCommand(GDBClient& client,
              std::unique_lock<std::mutex> lock(mtx_);
              std::string result;
              for (auto& thread : cache_.thread_debug_infos) {
-               if (!result.empty()) result += ",";
+               if (!result.empty()) {
+                 result += ",";
+               }
                result += std::to_string(thread->thread_id);
              }
              return "m" + result;
