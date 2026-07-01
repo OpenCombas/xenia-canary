@@ -1059,6 +1059,7 @@ if(XE_TARGET_X86_64 AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     target_compile_definitions(GameNetworkingSockets PUBLIC _WINDOWS)
   else()
     target_compile_definitions(GameNetworkingSockets PUBLIC POSIX LINUX)
+    target_compile_definitions(GameNetworkingSockets PRIVATE STEAMNETWORKINGSOCKETS_SNP_PARANOIA=1)
   endif()
 
   target_link_libraries(GameNetworkingSockets PUBLIC libprotobuf ${GNS_CRYPTO_LIBS})
