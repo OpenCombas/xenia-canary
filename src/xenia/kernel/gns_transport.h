@@ -18,9 +18,6 @@
 #include <shared_mutex>
 #include <thread>
 
-#include "xenia/kernel/kernel_state.h"
-#include "xenia/kernel/xobject.h"
-
 namespace xe {
 namespace kernel {
 
