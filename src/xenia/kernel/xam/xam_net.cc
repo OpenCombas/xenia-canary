@@ -18,6 +18,7 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/gns_transport.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/net_utils.h"
 #include "xenia/kernel/util/network_adapter_manager_interface.h"
@@ -796,6 +797,15 @@ dword_result_t NetDll_XNetServerToInAddr_entry(dword_t caller,
 
   pina->s_addr = htonl(server_addr);
 
+  // Route this title server over GNS too: derive its peer_key from the same
+  // online IP the server-side gateway uses (Phase 7).
+  if (GNSTransport::IsEnabled()) {
+    const uint64_t key = GNSTransport::ServerPeerKeyFromIna(pina->s_addr);
+    GNSTransport::Get()->MapPeer(pina->s_addr, key);
+    XELOGI("[GNS] mapped title server {} -> key xe:{:016x}",
+           ip_to_string(*pina), key);
+  }
+
   XELOGI("Server IP: {}", ip_to_string(*pina));
 
   return X_ERROR_SUCCESS;
@@ -833,6 +843,13 @@ dword_result_t NetDll_XNetTsAddrToInAddr_entry(dword_t caller,
   // Use XNKID to lookup security association?
 
   *ina_ptr = tsaddr_ptr->inaOnline;
+
+  // Route this title server over GNS too: derive its peer_key from the same
+  // online IP the server-side gateway uses (Phase 7).
+  if (GNSTransport::IsEnabled()) {
+    GNSTransport::Get()->MapPeer(ina_ptr->s_addr,
+                                 GNSTransport::ServerPeerKeyFromIna(ina_ptr->s_addr));
+  }
 
   IsValidXNKID(xnkid_ptr->as_uintBE64());
 
@@ -959,8 +976,8 @@ dword_result_t NetDll_XNetInAddrToXnAddr_entry(dword_t caller, dword_t in_addr,
       }
 
       if (player->MacAddress()) {
-        XLiveAPI::macAddressCache[xn_addr->inaOnline.s_addr] =
-            player->MacAddress();
+        XLiveAPI::CacheRemotePeerMac(xn_addr->inaOnline.s_addr,
+                                     player->MacAddress());
       }
     } else {
       // Remote mac missing for systemlink!
@@ -968,8 +985,8 @@ dword_result_t NetDll_XNetInAddrToXnAddr_entry(dword_t caller, dword_t in_addr,
       //
       // If we're connected to server then use it
       if (player->MacAddress()) {
-        XLiveAPI::macAddressCache[xn_addr->inaOnline.s_addr] =
-            player->MacAddress();
+        XLiveAPI::CacheRemotePeerMac(xn_addr->inaOnline.s_addr,
+                                     player->MacAddress());
       }
     }
   }

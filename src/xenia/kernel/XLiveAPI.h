@@ -11,6 +11,7 @@
 #define XENIA_KERNEL_XLIVEAPI_H_
 
 #include <future>
+#include <memory>
 #include <span>
 #include <unordered_set>
 
@@ -58,6 +59,8 @@ using user_settings_map =
 using gamerpics_pair = std::pair<std::vector<uint8_t>, std::vector<uint8_t>>;
 
 namespace kernel {
+
+class StandaloneSignalingBackend;
 
 class XLiveAPI {
  public:
@@ -285,7 +288,23 @@ class XLiveAPI {
   inline static std::map<uint32_t, uint64_t> sessionIdCache = {};
   inline static std::map<uint32_t, uint64_t> macAddressCache = {};
 
+  // Record a remote peer's online-IP -> MAC binding (the synthetic online IP is
+  // the guest's per-peer token; the 64-bit MAC is its stable cross-console id).
+  // Writes macAddressCache and mirrors the mapping into the GNS transport
+  // registry so guest sends to that online IP can route over GNS (Phase 4a).
+  // No-op for a zero MAC. Centralizes the single place these two address spaces
+  // meet; prefer this over writing macAddressCache directly.
+  static void CacheRemotePeerMac(uint32_t inaOnline, uint64_t mac);
+
  private:
+  // Bring up / tear down the GNS transport + signaling backend (Phase 5). Tied
+  // to netplay lifecycle: StartGNS from Init() once online, StopGNS from the
+  // destructor. No-ops unless the `gns` cvar is set.
+  void StartGNS();
+  void StopGNS();
+
+  std::unique_ptr<StandaloneSignalingBackend> gns_signaling_;
+
   const std::string default_local_server_ = "192.168.0.1:36000/";
 
   const std::string default_public_server_ =

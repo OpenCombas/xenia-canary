@@ -20,7 +20,6 @@ endif()
 target_link_libraries(xenia-kernel PUBLIC
   aes_128 fmt zlib-ng pugixml miniupnp xenia-apu xenia-base xenia-cpu xenia-hid xenia-vfs xenia-app-discord
 )
-
 if(WIN32)
   target_link_libraries(xenia-kernel PUBLIC
     libcurl
@@ -34,6 +33,14 @@ if(LINUX)
   )
 endif()
 
+# GameNetworkingSockets (NAT-traversed P2P netplay). Client GNS is Windows x64
+# only (the Linux gateway is a separate target). XE_GNS_ENABLED gates the
+# GNS-specific code in gns_transport.cc; elsewhere it compiles to inert stubs so
+# the kernel still builds on other platforms.
+if(WIN32 AND XE_TARGET_X86_64)
+  target_link_libraries(xenia-kernel PUBLIC GameNetworkingSockets)
+  target_compile_definitions(xenia-kernel PRIVATE XE_GNS_ENABLED)
+endif()
 xe_target_defaults(xenia-kernel)
 
 if(XENIA_BUILD_TESTS)

@@ -56,3 +56,10 @@ if(WIN32)
   add_subdirectory(hid/xinput)
   add_subdirectory(ui/d3d12)
 endif()
+
+# GNS gateway sidecar (server-side NAT traversal). GNS is x64-only; the gateway
+# is cross-platform: Windows (BCrypt crypto, vendored libcurl) and Linux
+# (OpenSSL crypto, system libcurl).
+if(XE_TARGET_X86_64 AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+  add_subdirectory(tools/gns_gateway)
+endif()

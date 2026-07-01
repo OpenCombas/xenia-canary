@@ -21,6 +21,8 @@
 #include "xenia/base/string_util.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/gns_signaling.h"
+#include "xenia/kernel/gns_transport.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/friends_util.h"
@@ -76,7 +78,49 @@ namespace kernel {
 XLiveAPI::XLiveAPI() {}
 
 XLiveAPI::~XLiveAPI() {
+  StopGNS();
   // TODO(Adrian): Cleanup libcurl multiplexing handles.
+}
+
+void XLiveAPI::StartGNS() {
+  if (!GNSTransport::IsEnabled()) {
+    return;
+  }
+
+  const uint64_t local_peer_key = GetConsoleMacAddress().to_uint64();
+  if (!local_peer_key) {
+    XELOGW("GNS: no console MAC address; not starting GNS transport");
+    return;
+  }
+
+  if (!GNSTransport::Get()->Initialize(local_peer_key)) {
+    XELOGE("GNS: transport initialize failed; using native sockets only");
+    return;
+  }
+
+  // Bring up signaling; without a relay URL peers can't establish P2P, but the
+  // transport stays up (already-mapped/loopback paths still work as before).
+  gns_signaling_ = std::make_unique<StandaloneSignalingBackend>();
+  if (gns_signaling_->Start(local_peer_key)) {
+    GNSTransport::Get()->SetSignalingBackend(gns_signaling_.get());
+    XELOGI("GNS: transport + signaling started");
+  } else {
+    gns_signaling_.reset();
+    XELOGW(
+        "GNS: signaling backend not started (set gns_signaling_url); peers "
+        "cannot connect over GNS");
+  }
+}
+
+void XLiveAPI::StopGNS() {
+  // Detach the backend before tearing it down so no in-flight GNS callback
+  // dereferences it, then stop the worker and the transport pump.
+  GNSTransport::Get()->SetSignalingBackend(nullptr);
+  if (gns_signaling_) {
+    gns_signaling_->Stop();
+    gns_signaling_.reset();
+  }
+  GNSTransport::Get()->Shutdown();
 }
 
 void XLiveAPI::IpGetConsoleXnAddr(XNADDR* XnAddr_ptr) {
@@ -325,6 +369,9 @@ void XLiveAPI::Init() {
 
   initialized_ = InitState::Success;
 
+  // Bring up GNS NAT traversal now that we're online and have our identity.
+  StartGNS();
+
   // Delete sessions on start-up.
   DeleteAllSessions();
 }
@@ -346,7 +393,28 @@ int8_t XLiveAPI::GetVersionStatus() const { return version_status_; }
 
 void XLiveAPI::clearXnaddrCache() {
   sessionIdCache.clear();
+
+  // Drop the mirrored GNS peer registry entries before forgetting the cache, so
+  // a stale online IP can't keep routing over GNS after a session teardown.
+  if (GNSTransport::IsEnabled()) {
+    auto* transport = GNSTransport::Get();
+    for (const auto& [inaOnline, mac] : macAddressCache) {
+      transport->UnmapPeer(inaOnline);
+    }
+  }
+
   macAddressCache.clear();
+}
+
+void XLiveAPI::CacheRemotePeerMac(uint32_t inaOnline, uint64_t mac) {
+  macAddressCache[inaOnline] = mac;
+
+  // Mirror into the GNS registry so XSocket can route guest UDP/VDP destined
+  // for this online IP over GNS (Phase 4a). The MAC is the symmetric peer_key:
+  // each end derives the same key for a given console.
+  if (mac && GNSTransport::IsEnabled()) {
+    GNSTransport::Get()->MapPeer(inaOnline, mac);
+  }
 }
 
 // Request data from the server

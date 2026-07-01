@@ -839,8 +839,18 @@ file(GLOB_RECURSE CURL_SOURCES
 add_library(libcurl STATIC ${CURL_SOURCES})
 target_link_libraries(libcurl PRIVATE crypt32 secur32)
 target_include_directories(libcurl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libcurl/lib ${CMAKE_CURRENT_SOURCE_DIR}/libcurl/include)
+# Equivalent to HTTP_ONLY (disable every non-HTTP protocol) but WITHOUT
+# CURL_DISABLE_WEBSOCKETS, so the WebSocket API (curl_ws_send/recv) stays
+# compiled in. HTTP_ONLY force-defines CURL_DISABLE_WEBSOCKETS with no override
+# (curl_setup.h), so it must be expanded by hand here. WS is used by the GNS
+# standalone signaling backend (docs/gns_integration.md, Phase 4b); wss:// works
+# via the Schannel TLS backend already configured below.
 target_compile_definitions(libcurl PRIVATE
-  BUILDING_LIBCURL HTTP_ONLY USE_SCHANNEL USE_WINDOWS_SSPI
+  BUILDING_LIBCURL USE_SCHANNEL USE_WINDOWS_SSPI
+  CURL_DISABLE_DICT CURL_DISABLE_FILE CURL_DISABLE_FTP CURL_DISABLE_GOPHER
+  CURL_DISABLE_IMAP CURL_DISABLE_LDAP CURL_DISABLE_LDAPS CURL_DISABLE_MQTT
+  CURL_DISABLE_POP3 CURL_DISABLE_RTSP CURL_DISABLE_SMTP CURL_DISABLE_TELNET
+  CURL_DISABLE_TFTP
 )
 endif()
 
@@ -892,4 +902,172 @@ if(NOT WIN32)
     COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/miniupnp/miniupnpc/updateminiupnpcstrings.sh
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/miniupnp/miniupnpc
   )
+endif()
+
+# ==============================================================================
+# GameNetworkingSockets (GNS) + protobuf
+# ==============================================================================
+# Valve's GameNetworkingSockets, used for NAT-traversed P2P netplay via
+# ISteamNetworkingMessages with SDR-less custom signaling (see
+# docs/gns_integration.md). Built on Windows x64 (the xenia client + the
+# gns-gateway) and Linux x64 (the gns-gateway only). Crypto backend is
+# per-platform: BCrypt on Windows, OpenSSL on Linux. macOS/ARM64 deferred.
+if(XE_TARGET_X86_64 AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+  set(GNS_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/GameNetworkingSockets)
+  set(GNS_SRC ${GNS_ROOT}/src)
+
+  # --- protobuf (pinned v21.12, last pre-Abseil release) ---
+  # protobuf is far too large to hand-write as a Xenia-style target, so we use
+  # its own CMake via add_subdirectory. This deviates from the surrounding
+  # hand-written third-party pattern by necessity. Builds static libprotobuf +
+  # the protoc compiler (so generated code always matches the linked runtime).
+  set(protobuf_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(protobuf_BUILD_CONFORMANCE OFF CACHE BOOL "" FORCE)
+  set(protobuf_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(protobuf_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(protobuf_BUILD_PROTOC_BINARIES ON CACHE BOOL "" FORCE)
+  set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)  # Xenia uses /MD
+  set(protobuf_WITH_ZLIB OFF CACHE BOOL "" FORCE)
+  set(protobuf_INSTALL OFF CACHE BOOL "" FORCE)
+  # protobuf 21.12 declares cmake_minimum_required(3.5); CMake 4.x needs an
+  # explicit opt-in to configure pre-3.5 projects.
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+  add_subdirectory(protobuf EXCLUDE_FROM_ALL)
+  unset(CMAKE_POLICY_VERSION_MINIMUM)
+
+  # --- protoc codegen for the 3 GNS .proto files ---
+  set(GNS_PROTO_DIR ${GNS_SRC}/common)
+  set(GNS_PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/gns_generated)
+  file(MAKE_DIRECTORY ${GNS_PROTO_GEN_DIR})
+  set(GNS_PROTO_NAMES
+    steamnetworkingsockets_messages_certs
+    steamnetworkingsockets_messages
+    steamnetworkingsockets_messages_udp
+  )
+  set(GNS_PROTO_SRCS "")
+  set(GNS_PROTO_HDRS "")
+  set(GNS_PROTO_INPUTS "")
+  foreach(_p ${GNS_PROTO_NAMES})
+    list(APPEND GNS_PROTO_SRCS ${GNS_PROTO_GEN_DIR}/${_p}.pb.cc)
+    list(APPEND GNS_PROTO_HDRS ${GNS_PROTO_GEN_DIR}/${_p}.pb.h)
+    list(APPEND GNS_PROTO_INPUTS ${GNS_PROTO_DIR}/${_p}.proto)
+  endforeach()
+  add_custom_command(
+    OUTPUT ${GNS_PROTO_SRCS} ${GNS_PROTO_HDRS}
+    COMMAND $<TARGET_FILE:protoc>
+            --proto_path=${GNS_PROTO_DIR}
+            --cpp_out=${GNS_PROTO_GEN_DIR}
+            ${GNS_PROTO_INPUTS}
+    DEPENDS protoc ${GNS_PROTO_INPUTS}
+    COMMENT "Generating GNS protobuf sources"
+    VERBATIM
+  )
+
+  # --- GameNetworkingSockets static library ---
+  add_library(GameNetworkingSockets STATIC
+    # common
+    ${GNS_SRC}/common/steamid.cpp
+    ${GNS_SRC}/steamnetworkingsockets/steamnetworkingsockets_certs.cpp
+    ${GNS_SRC}/steamnetworkingsockets/steamnetworkingsockets_certstore.cpp
+    ${GNS_SRC}/steamnetworkingsockets/steamnetworkingsockets_shared.cpp
+    ${GNS_SRC}/tier0/dbg.cpp
+    ${GNS_SRC}/tier0/platformtime.cpp
+    ${GNS_SRC}/tier0/valve_tracelogging.cpp
+    ${GNS_SRC}/tier1/netadr.cpp
+    ${GNS_SRC}/tier1/utlbuffer.cpp
+    ${GNS_SRC}/tier1/utlmemory.cpp
+    ${GNS_SRC}/tier1/ipv6text.c
+    ${GNS_SRC}/vstdlib/strtools.cpp
+    # clientlib
+    ${GNS_SRC}/steamnetworkingsockets/steamnetworkingsockets_stats.cpp
+    ${GNS_SRC}/steamnetworkingsockets/steamnetworkingsockets_thinker.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/csteamnetworkingmessages.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_flat.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_connections.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_socketthread.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_lowlevel_misc.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_spew.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_taskqueue.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_ice_client.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_p2p.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_p2p_ice.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_p2p_webrtc.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_snp.cpp
+    ${GNS_SRC}/steamnetworkingsockets/clientlib/steamnetworkingsockets_udp.cpp
+    # crypto (backend-agnostic; the BCrypt/OpenSSL backend is added below)
+    ${GNS_SRC}/common/crypto.cpp
+    ${GNS_SRC}/common/crypto_textencode.cpp
+    ${GNS_SRC}/common/keypair.cpp
+    # generated protobuf
+    ${GNS_PROTO_SRCS}
+  )
+
+  # --- Per-platform crypto backend ---
+  # Windows keeps BCrypt (AES/SHA) + reference 25519 donna, no external dep.
+  # Linux uses OpenSSL (libcrypto) for AES/SHA *and* 25519. See upstream
+  # GameNetworkingSockets/src/CMakeLists.txt for the canonical mapping.
+  if(WIN32)
+    target_sources(GameNetworkingSockets PRIVATE
+      ${GNS_SRC}/common/crypto_bcrypt.cpp
+      ${GNS_SRC}/common/crypto_25519_donna.cpp
+      ${GNS_SRC}/external/curve25519-donna/curve25519.c
+      ${GNS_SRC}/external/curve25519-donna/curve25519_VALVE_sse2.c
+      ${GNS_SRC}/external/ed25519-donna/ed25519_VALVE.c
+      ${GNS_SRC}/external/ed25519-donna/ed25519_VALVE_sse2.c
+    )
+    set(GNS_CRYPTO_DEFINES
+      VALVE_CRYPTO_BCRYPT VALVE_CRYPTO_25519_DONNA ED25519_HASH_BCRYPT)
+    set(GNS_CRYPTO_LIBS bcrypt)
+  else()
+    find_package(OpenSSL REQUIRED)
+    target_sources(GameNetworkingSockets PRIVATE
+      ${GNS_SRC}/common/crypto_openssl.cpp
+      ${GNS_SRC}/common/crypto_25519_openssl.cpp
+      ${GNS_SRC}/common/crypto_digest_opensslevp.cpp
+      ${GNS_SRC}/common/crypto_symmetric_opensslevp.cpp
+      ${GNS_SRC}/common/opensslwrapper.cpp
+    )
+    set(GNS_CRYPTO_DEFINES
+      VALVE_CRYPTO_OPENSSL VALVE_CRYPTO_25519_OPENSSLEVP)
+    set(GNS_CRYPTO_LIBS OpenSSL::Crypto)
+  endif()
+
+  target_include_directories(GameNetworkingSockets
+    PUBLIC
+      ${GNS_ROOT}/include
+    PRIVATE
+      ${GNS_SRC}
+      ${GNS_SRC}/common
+      ${GNS_SRC}/public
+      ${GNS_SRC}/steamnetworkingsockets
+      ${GNS_PROTO_GEN_DIR}
+  )
+
+  target_compile_definitions(GameNetworkingSockets
+    INTERFACE
+      STEAMNETWORKINGSOCKETS_STATIC_LINK
+    PRIVATE
+      STEAMNETWORKINGSOCKETS_FOREXPORT
+      STEAMNETWORKINGSOCKETS_ENABLE_ICE
+      VALVE_CRYPTO_ENABLE_25519  # exposes CCrypto 25519 key funcs (crypto_25519.h)
+      ENABLE_OPENSSLCONNECTION   # upstream kludge: 25519 path keys off this
+      ${GNS_CRYPTO_DEFINES}      # BCrypt (Win) or OpenSSL (Linux), set above
+  )
+  # Platform identity macros (GNS also auto-detects via __linux__/_WIN32).
+  if(WIN32)
+    target_compile_definitions(GameNetworkingSockets PUBLIC _WINDOWS)
+  else()
+    target_compile_definitions(GameNetworkingSockets PUBLIC POSIX LINUX)
+  endif()
+
+  target_link_libraries(GameNetworkingSockets PUBLIC libprotobuf ${GNS_CRYPTO_LIBS})
+  if(WIN32)
+    target_link_libraries(GameNetworkingSockets PUBLIC
+      ws2_32 crypt32 winmm iphlpapi)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(GameNetworkingSockets PUBLIC
+      Threads::Threads ${CMAKE_DL_LIBS})
+  endif()
 endif()
