@@ -472,6 +472,41 @@ Deferred polish (not blocking; revisit when runtime-testing against a relay):
   sensible Winsock result without an explicit mapping; add one if a title needs
   to observe GNS-specific failures.
 
+### Phase 6 — TCP connectivity over GNS — ✅ DONE (builds; runtime-untested)
+
+Implemented in `gns_transport.{h,cc}` (connection-oriented layer) and
+`xsocket.{h,cc}` (Connect/Listen/Accept/Send/Recv/Shutdown/Close seams).
+Compiles and links into `xenia_canary_netplay.exe` and `gns-gateway`.
+
+What landed:
+- **Transport stream API** (`StreamConnect`/`StreamListen`/`StreamStopListen`/
+  `StreamAccept`/`StreamSend`/`StreamRecv`/`StreamGetState`/`StreamClose`), kept
+  GNS-free in the header; per-connection state (`StreamConn`, `StreamListener`)
+  lives file-static in the `.cc` since the transport is a singleton. A global
+  `ConnectionStatusChanged` callback (registered in `Initialize`, driven by the
+  pump thread) handles inbound accept (`AcceptConnection`), connect completion,
+  and close/failure. `Service()` drains `ReceiveMessagesOnConnection` into each
+  connection's **byte-stream reassembly buffer**; `StreamRecv` hands out
+  arbitrary N-byte chunks (0 = peer closed/EOF).
+- **XSocket wiring:** `Connect` → `StreamConnect` when the dest is a mapped peer
+  (blocking wait for establish, 15 s cap); `Listen` → `StreamListen(bound_port)`
+  (GNS-only for TCP hosts, see limits); `Accept` → `StreamAccept` wrapping the
+  connection in a native-handle-less child `XSocket`; `Send`/`Recv` route through
+  the stream; `Close` tears down stream/listener. `IOControl` tracks `FIONBIO`
+  into `nonblocking_` so recv/accept block appropriately. New `X_WSAError` codes
+  (`NOTCONN`/`TIMEDOUT`/`CONNREFUSED`) for connect/send failures.
+
+v1 limitations (documented, revisit if a title needs them):
+- **Native TCP host while `gns` is on** is not dual-stacked — a bound TCP socket
+  that `Listen`s goes GNS-only (P2P). System-link TCP servers would need the
+  native path back.
+- **Non-blocking `connect`** falls back to a (bounded) blocking wait.
+- **Half-close** (`shutdown(SD_SEND)`) is a no-op over GNS (`LingerClose` is
+  bidirectional).
+- **Overlapped TCP recv** (`WSARecv`) isn't routed; blocking `Recv`/`Send` are.
+
+Original plan follows.
+
 ### Phase 6 — TCP connectivity over GNS (after UDP/VDP proves out)
 
 The UDP/VDP path (Phases 2–5) uses `ISteamNetworkingMessages` (connectionless).

@@ -106,6 +106,41 @@ class GNSTransport {
   // 48-63 to never collide with the 48-bit console MAC keys used for peers.
   static uint64_t ServerPeerKeyFromIna(uint32_t ina);
 
+  // --- Connection-oriented (TCP) support (Phase 6) --------------------------
+  // TCP/stream sockets use GNS's connection-oriented API (reliable, ordered) --
+  // a natural fit for TCP -- reusing the same registry + signaling + ICE as the
+  // datagram path. Connections are identified by an opaque handle (0 = invalid).
+  // P2P only: the caller (XSocket) picks GNS vs native by whether the peer is
+  // mapped, exactly as for datagrams.
+  enum class StreamState { kConnecting, kConnected, kClosed };
+
+  // Client: initiate a connection to a mapped peer on virtual port dst_vport.
+  // Returns a connection handle, or 0 if the peer isn't mapped / not up.
+  uint32_t StreamConnect(uint32_t guest_ina, uint16_t dst_vport);
+
+  // Server: start / stop listening for inbound connections on virtual port
+  // vport (the guest's bound TCP port).
+  bool StreamListen(uint16_t vport);
+  void StreamStopListen(uint16_t vport);
+
+  // Server: pop the next established inbound connection on vport, returning its
+  // handle and the peer's guest_ina. Returns 0 if none pending (wait=false) or
+  // if aborted. Blocks on the listener when wait=true.
+  uint32_t StreamAccept(uint16_t vport, bool wait, uint32_t* out_peer_ina);
+
+  // Send reliable, ordered bytes on a connection. Returns bytes queued or -1.
+  int StreamSend(uint32_t conn, const uint8_t* data, size_t len);
+
+  // Read up to len bytes from the connection's byte-stream reassembly buffer.
+  // Returns >0 bytes read; 0 if the peer closed and the buffer is drained; -1 if
+  // no data is buffered and the connection is still open (wait=false) / aborted.
+  int StreamRecv(uint32_t conn, uint8_t* buf, size_t len, bool wait);
+
+  StreamState StreamGetState(uint32_t conn);
+
+  // Close a connection. linger=true flushes queued reliable data first.
+  void StreamClose(uint32_t conn, bool linger);
+
  private:
   GNSTransport() = default;
 

@@ -15,10 +15,14 @@
 #include "xenia/base/logging.h"
 
 #ifdef XE_GNS_ENABLED
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <memory>
 #include <vector>
 
 #include "xenia/base/threading.h"
@@ -324,6 +328,123 @@ void DebugOutputFn(ESteamNetworkingSocketsDebugOutputType type,
   }
 }
 
+// --- Connection-oriented (TCP) state (Phase 6) ------------------------------
+// GNSTransport is a singleton, so the per-connection stream state lives here as
+// file-static rather than bloating the (GNS-free) header with GNS handle types.
+
+enum { kStreamConnecting = 0, kStreamConnected = 1, kStreamClosed = 2 };
+
+// One TCP-over-GNS connection: the GNS handle, the peer, and a byte-stream
+// reassembly buffer that turns GNS's discrete reliable messages back into the
+// boundary-less stream the guest expects.
+struct StreamConn {
+  HSteamNetConnection h = k_HSteamNetConnection_Invalid;
+  uint64_t peer_key = 0;
+  uint16_t listen_vport = 0;  // 0 => client-initiated (outbound)
+  std::atomic<int> state{kStreamConnecting};
+  std::mutex mutex;               // guards rx / rx_read
+  std::condition_variable cv;     // woken on data or state change
+  std::vector<uint8_t> rx;        // reassembly buffer
+  size_t rx_read = 0;             // consumed prefix of rx
+};
+
+// A listen socket bound to a guest TCP port, plus a queue of established inbound
+// connections awaiting the guest's Accept().
+struct StreamListener {
+  HSteamListenSocket h = k_HSteamListenSocket_Invalid;
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<HSteamNetConnection> pending;
+  bool stopping = false;
+};
+
+std::mutex g_streams_mutex;  // guards the three maps below
+std::map<HSteamNetConnection, std::shared_ptr<StreamConn>> g_streams;
+std::map<uint16_t, std::shared_ptr<StreamListener>> g_listeners;
+std::map<HSteamListenSocket, uint16_t> g_listen_vport;
+
+std::shared_ptr<StreamConn> FindStream(HSteamNetConnection h) {
+  std::lock_guard<std::mutex> lock(g_streams_mutex);
+  auto it = g_streams.find(h);
+  return it != g_streams.end() ? it->second : nullptr;
+}
+
+// Global callback GNS invokes (on the pump thread, during RunCallbacks) for
+// every connection-oriented state change: inbound accept, connect completion,
+// and close/failure.
+void ConnectionStatusChangedFn(
+    SteamNetConnectionStatusChangedCallback_t* info) {
+  const HSteamNetConnection h = info->m_hConn;
+  switch (info->m_info.m_eState) {
+    case k_ESteamNetworkingConnectionState_Connecting: {
+      const HSteamListenSocket ls = info->m_info.m_hListenSocket;
+      if (ls == k_HSteamListenSocket_Invalid) {
+        break;  // outbound; StreamConnect already created the StreamConn
+      }
+      uint16_t vport = 0;
+      {
+        std::lock_guard<std::mutex> lock(g_streams_mutex);
+        auto it = g_listen_vport.find(ls);
+        if (it == g_listen_vport.end()) {
+          break;  // not one of ours
+        }
+        vport = it->second;
+      }
+      uint64_t key = GNSTransport::PeerKeyFromIdentityString(
+          info->m_info.m_identityRemote.GetGenericString());
+      if (!key ||
+          SteamNetworkingSockets()->AcceptConnection(h) != k_EResultOK) {
+        SteamNetworkingSockets()->CloseConnection(h, 0, nullptr, false);
+        break;
+      }
+      auto conn = std::make_shared<StreamConn>();
+      conn->h = h;
+      conn->peer_key = key;
+      conn->listen_vport = vport;
+      std::lock_guard<std::mutex> lock(g_streams_mutex);
+      g_streams[h] = conn;
+      break;
+    }
+    case k_ESteamNetworkingConnectionState_Connected: {
+      auto conn = FindStream(h);
+      if (!conn) {
+        break;
+      }
+      conn->state.store(kStreamConnected);
+      conn->cv.notify_all();  // wake a StreamConnect waiter
+      if (conn->listen_vport) {
+        std::shared_ptr<StreamListener> ln;
+        {
+          std::lock_guard<std::mutex> lock(g_streams_mutex);
+          auto it = g_listeners.find(conn->listen_vport);
+          if (it != g_listeners.end()) {
+            ln = it->second;
+          }
+        }
+        if (ln) {
+          std::lock_guard<std::mutex> lk(ln->mutex);
+          ln->pending.push_back(h);
+          ln->cv.notify_all();
+        }
+      }
+      break;
+    }
+    case k_ESteamNetworkingConnectionState_ClosedByPeer:
+    case k_ESteamNetworkingConnectionState_ProblemDetectedLocally: {
+      if (auto conn = FindStream(h)) {
+        conn->state.store(kStreamClosed);
+        conn->cv.notify_all();  // wake blocked StreamRecv -> EOF
+      }
+      // Required to release the handle; the StreamConn is kept so the guest can
+      // still drain buffered bytes and observe the close (StreamClose erases it).
+      SteamNetworkingSockets()->CloseConnection(h, 0, nullptr, false);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 }  // namespace
 
 bool GNSTransport::Initialize(uint64_t local_peer_key) {
@@ -349,6 +470,10 @@ bool GNSTransport::Initialize(uint64_t local_peer_key) {
       k_ESteamNetworkingConfig_Callback_CreateConnectionSignaling,
       reinterpret_cast<void*>(&CreateConnectionSignalingFn));
   utils->SetGlobalCallback_MessagesSessionRequest(&MessagesSessionRequestFn);
+  // Connection-oriented (TCP) state changes: inbound accept, connect
+  // completion, close/failure (Phase 6).
+  utils->SetGlobalCallback_SteamNetConnectionStatusChanged(
+      &ConnectionStatusChangedFn);
 
   // NAT traversal via the built-in ICE client, configured from cvars.
   utils->SetGlobalConfigValueString(
@@ -404,6 +529,23 @@ void GNSTransport::Shutdown() {
   pump_running_.store(false);
   if (pump_thread_.joinable()) {
     pump_thread_.join();
+  }
+  // Wake any blocked StreamRecv/StreamAccept and drop all stream state before
+  // tearing down the library.
+  {
+    std::lock_guard<std::mutex> lock(g_streams_mutex);
+    for (auto& [h, c] : g_streams) {
+      c->state.store(kStreamClosed);
+      c->cv.notify_all();
+    }
+    for (auto& [vp, ln] : g_listeners) {
+      std::lock_guard<std::mutex> lk(ln->mutex);
+      ln->stopping = true;
+      ln->cv.notify_all();
+    }
+    g_streams.clear();
+    g_listeners.clear();
+    g_listen_vport.clear();
   }
   GameNetworkingSockets_Kill();
   initialized_.store(false);
@@ -474,6 +616,41 @@ void GNSTransport::Service() {
                          std::memory_order_relaxed);
     msg->Release();
   }
+
+  // Drain reliable bytes on active stream (TCP) connections into their
+  // per-connection reassembly buffers.
+  std::vector<std::shared_ptr<StreamConn>> conns;
+  {
+    std::lock_guard<std::mutex> lock(g_streams_mutex);
+    conns.reserve(g_streams.size());
+    for (auto& [h, c] : g_streams) {
+      conns.push_back(c);
+    }
+  }
+  ISteamNetworkingSockets* sockets = SteamNetworkingSockets();
+  for (auto& conn : conns) {
+    if (conn->state.load() != kStreamConnected) {
+      continue;
+    }
+    SteamNetworkingMessage_t* stream_msgs[16];
+    int n = sockets->ReceiveMessagesOnConnection(conn->h, stream_msgs, 16);
+    if (n <= 0) {
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> lk(conn->mutex);
+      for (int i = 0; i < n; ++i) {
+        const uint8_t* p =
+            reinterpret_cast<const uint8_t*>(stream_msgs[i]->m_pData);
+        conn->rx.insert(conn->rx.end(), p, p + stream_msgs[i]->m_cbSize);
+        g_rx_bytes.fetch_add(static_cast<uint64_t>(stream_msgs[i]->m_cbSize),
+                             std::memory_order_relaxed);
+        stream_msgs[i]->Release();
+      }
+    }
+    conn->cv.notify_all();
+    g_rx_packets.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+  }
 }
 
 bool GNSTransport::SendTo(uint32_t guest_ina, uint16_t src_port,
@@ -530,6 +707,192 @@ void GNSTransport::DeliverInboundSignal(const uint8_t* data, size_t len) {
                                                     &g_recv_context);
 }
 
+// --- Connection-oriented (TCP) API (Phase 6) --------------------------------
+
+uint32_t GNSTransport::StreamConnect(uint32_t guest_ina, uint16_t dst_vport) {
+  if (!initialized_.load()) {
+    return 0;
+  }
+  uint64_t key;
+  {
+    std::shared_lock<std::shared_mutex> lock(registry_mutex_);
+    auto it = ina_to_key_.find(guest_ina);
+    if (it == ina_to_key_.end()) {
+      return 0;
+    }
+    key = it->second;
+  }
+
+  SteamNetworkingIdentity id = MakeIdentity(key);
+  HSteamNetConnection h = SteamNetworkingSockets()->ConnectP2P(
+      id, static_cast<int>(dst_vport), 0, nullptr);
+  if (h == k_HSteamNetConnection_Invalid) {
+    return 0;
+  }
+
+  auto conn = std::make_shared<StreamConn>();
+  conn->h = h;
+  conn->peer_key = key;
+  {
+    std::lock_guard<std::mutex> lock(g_streams_mutex);
+    g_streams[h] = conn;
+  }
+  XELOGI("[GNS] StreamConnect xe:{:016x} vport {} -> conn {}", key, dst_vport, h);
+  return h;
+}
+
+bool GNSTransport::StreamListen(uint16_t vport) {
+  if (!initialized_.load()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(g_streams_mutex);
+  if (g_listeners.count(vport)) {
+    return true;  // already listening on this port
+  }
+  HSteamListenSocket ls = SteamNetworkingSockets()->CreateListenSocketP2P(
+      static_cast<int>(vport), 0, nullptr);
+  if (ls == k_HSteamListenSocket_Invalid) {
+    return false;
+  }
+  auto ln = std::make_shared<StreamListener>();
+  ln->h = ls;
+  g_listeners[vport] = ln;
+  g_listen_vport[ls] = vport;
+  XELOGI("[GNS] StreamListen vport {} -> listen {}", vport, ls);
+  return true;
+}
+
+void GNSTransport::StreamStopListen(uint16_t vport) {
+  std::shared_ptr<StreamListener> ln;
+  {
+    std::lock_guard<std::mutex> lock(g_streams_mutex);
+    auto it = g_listeners.find(vport);
+    if (it == g_listeners.end()) {
+      return;
+    }
+    ln = it->second;
+    g_listen_vport.erase(ln->h);
+    g_listeners.erase(it);
+  }
+  {
+    std::lock_guard<std::mutex> lk(ln->mutex);
+    ln->stopping = true;
+  }
+  ln->cv.notify_all();
+  SteamNetworkingSockets()->CloseListenSocket(ln->h);
+}
+
+uint32_t GNSTransport::StreamAccept(uint16_t vport, bool wait,
+                                    uint32_t* out_peer_ina) {
+  std::shared_ptr<StreamListener> ln;
+  {
+    std::lock_guard<std::mutex> lock(g_streams_mutex);
+    auto it = g_listeners.find(vport);
+    if (it == g_listeners.end()) {
+      return 0;
+    }
+    ln = it->second;
+  }
+
+  HSteamNetConnection h = k_HSteamNetConnection_Invalid;
+  {
+    std::unique_lock<std::mutex> lk(ln->mutex);
+    while (ln->pending.empty()) {
+      if (ln->stopping || !initialized_.load()) {
+        return 0;
+      }
+      if (!wait) {
+        return 0;
+      }
+      ln->cv.wait_for(lk, std::chrono::milliseconds(500));
+    }
+    h = ln->pending.front();
+    ln->pending.pop_front();
+  }
+
+  if (out_peer_ina) {
+    auto conn = FindStream(h);
+    *out_peer_ina = conn ? ResolveOrRegisterInbound(conn->peer_key) : 0;
+  }
+  return h;
+}
+
+int GNSTransport::StreamSend(uint32_t conn, const uint8_t* data, size_t len) {
+  auto c = FindStream(conn);
+  if (!c || c->state.load() == kStreamClosed) {
+    return -1;
+  }
+  EResult r = SteamNetworkingSockets()->SendMessageToConnection(
+      conn, data, static_cast<uint32_t>(len), k_nSteamNetworkingSend_Reliable,
+      nullptr);
+  if (r != k_EResultOK) {
+    return -1;
+  }
+  g_tx_packets.fetch_add(1, std::memory_order_relaxed);
+  g_tx_bytes.fetch_add(len, std::memory_order_relaxed);
+  return static_cast<int>(len);
+}
+
+int GNSTransport::StreamRecv(uint32_t conn, uint8_t* buf, size_t len,
+                             bool wait) {
+  auto c = FindStream(conn);
+  if (!c) {
+    return -1;
+  }
+  std::unique_lock<std::mutex> lk(c->mutex);
+  for (;;) {
+    size_t avail = c->rx.size() - c->rx_read;
+    if (avail > 0) {
+      size_t n = std::min(avail, len);
+      std::memcpy(buf, c->rx.data() + c->rx_read, n);
+      c->rx_read += n;
+      if (c->rx_read == c->rx.size()) {  // fully drained -> reclaim
+        c->rx.clear();
+        c->rx_read = 0;
+      }
+      return static_cast<int>(n);
+    }
+    if (c->state.load() == kStreamClosed) {
+      return 0;  // closed and drained -> EOF
+    }
+    if (!wait || !initialized_.load()) {
+      return -1;  // would block
+    }
+    c->cv.wait_for(lk, std::chrono::milliseconds(500));
+  }
+}
+
+GNSTransport::StreamState GNSTransport::StreamGetState(uint32_t conn) {
+  auto c = FindStream(conn);
+  if (!c) {
+    return StreamState::kClosed;
+  }
+  switch (c->state.load()) {
+    case kStreamConnected:
+      return StreamState::kConnected;
+    case kStreamClosed:
+      return StreamState::kClosed;
+    default:
+      return StreamState::kConnecting;
+  }
+}
+
+void GNSTransport::StreamClose(uint32_t conn, bool linger) {
+  std::shared_ptr<StreamConn> c;
+  {
+    std::lock_guard<std::mutex> lock(g_streams_mutex);
+    auto it = g_streams.find(conn);
+    if (it == g_streams.end()) {
+      return;
+    }
+    c = it->second;
+    g_streams.erase(it);
+  }
+  c->state.store(kStreamClosed);
+  c->cv.notify_all();
+  SteamNetworkingSockets()->CloseConnection(conn, 0, nullptr, linger);
+}
+
 #else  // !XE_GNS_ENABLED
 
 // Inert stubs for platforms where GNS is not built (non-Windows / non-x64).
@@ -544,6 +907,16 @@ bool GNSTransport::SendTo(uint32_t, uint16_t, uint16_t, const uint8_t*, size_t,
   return false;
 }
 void GNSTransport::DeliverInboundSignal(const uint8_t*, size_t) {}
+uint32_t GNSTransport::StreamConnect(uint32_t, uint16_t) { return 0; }
+bool GNSTransport::StreamListen(uint16_t) { return false; }
+void GNSTransport::StreamStopListen(uint16_t) {}
+uint32_t GNSTransport::StreamAccept(uint16_t, bool, uint32_t*) { return 0; }
+int GNSTransport::StreamSend(uint32_t, const uint8_t*, size_t) { return -1; }
+int GNSTransport::StreamRecv(uint32_t, uint8_t*, size_t, bool) { return -1; }
+GNSTransport::StreamState GNSTransport::StreamGetState(uint32_t) {
+  return StreamState::kClosed;
+}
+void GNSTransport::StreamClose(uint32_t, bool) {}
 
 #endif  // XE_GNS_ENABLED
 

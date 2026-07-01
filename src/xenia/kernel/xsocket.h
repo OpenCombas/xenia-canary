@@ -53,6 +53,9 @@ enum class X_WSAError : uint32_t {
   X_WSANOTINITIALISED = 0x276D,
   X_WSAEADDRINUSE = 0x2740,
   X_WSAEINPROGRESS = 0x2734,
+  X_WSAENOTCONN = 0x2749,
+  X_WSAETIMEDOUT = 0x274C,
+  X_WSAECONNREFUSED = 0x274D,
 };
 
 /*
@@ -233,6 +236,14 @@ class XSocket : public XObject {
   // peers) with native fallback. Decided at Bind. See docs/gns_integration.md.
   bool use_gns_ = false;
 
+  // TCP-over-GNS state (Phase 6). gns_stream_ is the connection handle for a
+  // GNS-backed stream socket (0 = none); gns_listen_ marks a GNS TCP listen
+  // socket. nonblocking_ tracks FIONBIO so GNS connect/recv/accept know whether
+  // to block.
+  uint32_t gns_stream_ = 0;
+  bool gns_listen_ = false;
+  bool nonblocking_ = false;
+
   // Global registry mapping a bound port (host byte order) to the GNS-enabled
   // socket listening on it, so the transport's receive handler can deliver
   // inbound datagrams to the right socket.
@@ -255,6 +266,12 @@ class XSocket : public XObject {
   void MaybeEnableGNS();
   int RecvFromGNS(uint8_t* buf, uint32_t buf_len, XSOCKADDR_IN* from);
   int PollWSARecvFromGNS(bool wait, struct WSARecvFromData data);
+
+  // TCP-over-GNS helpers (Phase 6). Connect/Accept establish a stream over the
+  // connection-oriented GNS API; Send/Recv move bytes through the reassembly
+  // buffer. See docs/gns_integration.md.
+  X_STATUS ConnectGNSStream(uint32_t dst_ina, uint16_t dst_vport);
+  object_ref<XSocket> AcceptGNSStream(XSOCKADDR_IN* name, int* name_len);
 
   void SetLastWSAError(X_WSAError) const;
 };
