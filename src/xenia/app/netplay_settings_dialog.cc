@@ -10,8 +10,11 @@
 #include "xenia/app/netplay_settings_dialog.h"
 #include "xenia/app/discord/discord_presence.h"
 #include "xenia/app/emulator_window.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/system.h"
+#include "xenia/config.h"
+#include "xenia/kernel/log_uploader.h"
 
 DECLARE_string(api_address);
 
@@ -29,8 +32,53 @@ DECLARE_bool(discord);
 
 DECLARE_int32(discord_presence_user_index);
 
+// Netplay voice (defined in kernel/voice_channel.cc) exposed in the Voice tab.
+DECLARE_bool(voice_denoise);
+DECLARE_bool(voice_vad);
+DECLARE_int32(voice_vad_prob);
+DECLARE_bool(voice_agc);
+DECLARE_int32(voice_agc_target);
+DECLARE_int32(voice_agc_max_gain);
+DECLARE_int32(voice_mic_gain);
+DECLARE_bool(voice_duck);
+DECLARE_int32(voice_duck_atten);
+DECLARE_int32(voice_output_gain);
+
 namespace xe {
 namespace app {
+
+namespace {
+// Push a cvar's current value into its config slot so SaveConfig persists it
+// (the UI edits the live cvars::x directly for immediate effect; this syncs the
+// on-disk config value, which SaveConfig serializes).
+template <typename T>
+void PersistCvar(const char* name, T value) {
+  if (!cvar::ConfigVars) {
+    return;
+  }
+  auto it = cvar::ConfigVars->find(name);
+  if (it == cvar::ConfigVars->end()) {
+    return;
+  }
+  if (auto* var = dynamic_cast<cvar::ConfigVar<T>*>(it->second)) {
+    var->SetConfigValue(value);
+  }
+}
+
+void SaveVoiceCvars() {
+  PersistCvar("voice_denoise", cvars::voice_denoise);
+  PersistCvar("voice_vad", cvars::voice_vad);
+  PersistCvar("voice_vad_prob", cvars::voice_vad_prob);
+  PersistCvar("voice_agc", cvars::voice_agc);
+  PersistCvar("voice_agc_target", cvars::voice_agc_target);
+  PersistCvar("voice_agc_max_gain", cvars::voice_agc_max_gain);
+  PersistCvar("voice_mic_gain", cvars::voice_mic_gain);
+  PersistCvar("voice_duck", cvars::voice_duck);
+  PersistCvar("voice_duck_atten", cvars::voice_duck_atten);
+  PersistCvar("voice_output_gain", cvars::voice_output_gain);
+  config::SaveConfig();
+}
+}  // namespace
 
 void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
   if (!dialog_opened_) {
@@ -64,6 +112,9 @@ void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
     const bool updatable =
         xlive_api->GetInitState() == xe::kernel::XLiveAPI::InitState::Pending;
 
+    if (ImGui::BeginTabBar("##netplay_settings_tabs")) {
+    const bool network_tab = ImGui::BeginTabItem("Network");
+    if (network_tab) {
     ImGui::Text("API Addresses");
 
     ImGui::SetNextItemWidth(window_width);
@@ -389,6 +440,142 @@ void NetplaySettingsDialog::OnDraw(ImGuiIO& io) {
 
       ImGui::EndPopup();
     }
+
+    ImGui::EndTabItem();
+    }  // Network tab
+
+    if (ImGui::BeginTabItem("Voice")) {
+      ImGui::TextDisabled("Party / netplay voice chat");
+      ImGui::Separator();
+
+      ImGui::Checkbox("Noise suppression (RNNoise)", &cvars::voice_denoise);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Removes background noise. Takes effect on restart.");
+
+      ImGui::Checkbox("Voice activity gate", &cvars::voice_vad);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Only transmit while you're actually speaking.");
+      ImGui::BeginDisabled(!cvars::voice_vad);
+      ImGui::SetNextItemWidth(window_width);
+      ImGui::SliderInt("Sensitivity##vad", &cvars::voice_vad_prob, 0, 100,
+                       "%d%%");
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Higher = require clearer speech to open the mic (rejects more "
+            "noise).");
+      ImGui::EndDisabled();
+
+      ImGui::Separator();
+      ImGui::Checkbox("Auto gain control", &cvars::voice_agc);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Auto-level your mic volume. Supersedes Mic Volume when on.");
+      ImGui::BeginDisabled(!cvars::voice_agc);
+      ImGui::SetNextItemWidth(window_width);
+      ImGui::SliderInt("Target level##agc", &cvars::voice_agc_target, 1000,
+                       12000);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Loudness AGC aims for. Higher = louder transmitted voice; lower if "
+            "it clips.");
+      ImGui::SetNextItemWidth(window_width);
+      ImGui::SliderInt("Max boost##agc", &cvars::voice_agc_max_gain, 100, 2000,
+                       "%d%%");
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Cap on how much AGC amplifies a quiet mic, so noise in gaps isn't "
+            "blown up.");
+      ImGui::EndDisabled();
+      ImGui::BeginDisabled(cvars::voice_agc);
+      ImGui::SetNextItemWidth(window_width);
+      ImGui::SliderInt("Mic volume##gain", &cvars::voice_mic_gain, 50, 500,
+                       "%d%%");
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Manual mic gain (used when AGC is off).");
+      ImGui::EndDisabled();
+
+      ImGui::Separator();
+      ImGui::Checkbox("Feedback guard (ducking)", &cvars::voice_duck);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Attenuate the mic while others talk to stop speaker echo/howl. No "
+            "effect on headsets.");
+      ImGui::BeginDisabled(!cvars::voice_duck);
+      ImGui::SetNextItemWidth(window_width);
+      ImGui::SliderInt("Duck amount##duck", &cvars::voice_duck_atten, 0, 100,
+                       "%d%%");
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Lower ducks harder: more echo rejection, more of your own speech "
+            "lost.");
+      ImGui::EndDisabled();
+
+      ImGui::Separator();
+      ImGui::SetNextItemWidth(window_width);
+      ImGui::SliderInt("Playback volume##out", &cvars::voice_output_gain, 0, 400,
+                       "%d%%");
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Volume of received party / peer voice on your output.");
+
+      ImGui::Spacing();
+      static double voice_saved_until = 0.0;
+      if (ImGui::Button("Save Voice Settings",
+                        ImVec2(window_width, btn_height))) {
+        SaveVoiceCvars();
+        voice_saved_until = ImGui::GetTime() + 3.0;
+      }
+      if (voice_saved_until > ImGui::GetTime()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Saved!");
+      }
+      ImGui::TextDisabled("Changes apply live; Save keeps them across restarts.");
+      ImGui::EndTabItem();
+    }
+
+    if (ImGui::BeginTabItem("Diagnostics")) {
+      auto* uploader = xe::kernel::LogUploader::Get();
+      uploader->RefreshAvailability();  // server-gated probe (throttled)
+
+      ImGui::TextWrapped(
+          "Upload your current log to the project to help diagnose netplay "
+          "issues. It includes your IP, gamertag and console info.");
+      ImGui::Separator();
+
+      static char note_buf[256] = {0};
+      ImGui::TextUnformatted("What happened? (optional)");
+      ImGui::InputTextMultiline("##lognote", note_buf, sizeof(note_buf),
+                                ImVec2(window_width, 55));
+
+      const bool avail = uploader->available();
+      const bool busy =
+          uploader->state() == xe::kernel::LogUploader::State::kUploading;
+
+      ImGui::BeginDisabled(!avail || busy);
+      if (ImGui::Button("Upload Log to Project",
+                        ImVec2(window_width, btn_height))) {
+        uploader->Upload(note_buf);
+      }
+      ImGui::EndDisabled();
+      if (!avail &&
+          ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Log upload isn't currently enabled by the server.");
+      }
+
+      const auto st = uploader->state();
+      const std::string msg = uploader->status_message();
+      if (busy) {
+        ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.3f, 1.0f), "%s", msg.c_str());
+      } else if (st == xe::kernel::LogUploader::State::kDone) {
+        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "%s", msg.c_str());
+      } else if (st == xe::kernel::LogUploader::State::kFailed) {
+        ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f), "%s", msg.c_str());
+      } else if (!avail) {
+        ImGui::TextDisabled("Not currently accepting uploads.");
+      }
+      ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+    }  // tab bar
 
     ImGui::SetWindowFontScale(1.0f);
 

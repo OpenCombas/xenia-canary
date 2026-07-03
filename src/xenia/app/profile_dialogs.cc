@@ -504,8 +504,8 @@ void ManagerDialog::Initalize(ui::ImGuiDrawer* imgui_drawer,
 
   friends_presence_ =
       emulator_->GetXboxLiveAPI()->GetFriendsPresenceAsync(profile->xuid());
-  immediate_gamerpics_ = emulator_->GetXboxLiveAPI()->GetFriendsGamerpicsAsync(
-      profile->xuid(), imgui_drawer);
+  // Server-friend gamerpics are fetched inside xeDrawFriendsContent (shared by
+  // all hosts of the friends list), not from the config friends here.
 }
 
 void ManagerDialog::OnDraw(ImGuiIO& io) {
@@ -513,9 +513,9 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
     manager_opened_ = true;
     ImGui::OpenPopup("Manager");
 
-    if (emulator_->GetXboxLiveAPI()->IsConnectedToServer()) {
-      friends_args.filter_offline = true;
-    }
+    // Show all friends by default (see FriendsUI): don't hide people while
+    // server presence lags / the online flag is being finalized.
+    friends_args.filter_offline = false;
 
     sessions_args.filter_own = true;
   }
@@ -611,9 +611,6 @@ void ManagerDialog::OnDraw(ImGuiIO& io) {
 
       friends_presence_ =
           emulator_->GetXboxLiveAPI()->GetFriendsPresenceAsync(profile->xuid());
-      immediate_gamerpics_ =
-          emulator_->GetXboxLiveAPI()->GetFriendsGamerpicsAsync(profile->xuid(),
-                                                                imgui_drawer());
     }
 
     if (immediate_gamerpics_.valid()) {

@@ -30,8 +30,7 @@ class FriendsUI : public XamDialog {
   ui::FriendsContentArgs args = {};
   std::future<std::vector<FriendPresenceObjectJSON>> friends_presence_;
   std::vector<FriendPresenceObjectJSON> friends_presence_result_;
-  std::future<std::map<uint64_t, std::shared_ptr<xe::ui::ImmediateTexture>>>
-      immediate_gamerpics_;
+  // Gamerpic textures for the friends list, populated by xeDrawFriendsContent.
   std::map<uint64_t, std::shared_ptr<xe::ui::ImmediateTexture>>
       immediate_gamerpics_result_;
 };

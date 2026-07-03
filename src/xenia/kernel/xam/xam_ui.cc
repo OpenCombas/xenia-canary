@@ -13,6 +13,9 @@
 #include "xenia/base/system.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/friends_manager.h"
+#include "xenia/kernel/party_manager.h"
+#include "xenia/kernel/recent_manager.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -1112,6 +1115,25 @@ bool xeDrawFriendContent(xe::ui::ImGuiDrawer* imgui_drawer,
       ImGui::SetTooltip("Add Friend");
     }
   }
+
+  // Invite to Party -- the netplay voice party (decoupled from game sessions).
+  // One click: auto-creates your party if you don't have one, then invites this
+  // friend; they'll see the invite in their Manager tab.
+  if (!is_self) {
+    PartyManager* party = PartyManager::Get();
+    const bool already = party->IsMember(friend_xuid);
+    const std::string party_label =
+        std::format("Invite to Party##{}", friend_xuid_str);
+    ImGui::BeginDisabled(already);
+    if (ImGui::Button(party_label.c_str())) {
+      party->Invite(friend_xuid);
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      ImGui::SetTooltip(already ? "Already in your party"
+                                : "Invite to your voice party");
+    }
+  }
   ImGui::EndGroup();
 
   ImVec2 buttons_row_size = ImGui::GetItemRectSize();
@@ -1320,6 +1342,355 @@ bool xeDrawAddFriend(xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
   return true;
 }
 
+// Netplay party/voice panel: pending invites (accept/decline) + the current
+// party roster (leave). Drawn at the top of the Friends modal.
+static void xeDrawPartyPanel() {
+  PartyManager* party = PartyManager::Get();
+
+  const auto invites = party->GetInvites();
+  for (const auto& inv : invites) {
+    const std::string who = inv.from_gamertag.empty()
+                                ? fmt::format("{:016X}", inv.from_xuid)
+                                : inv.from_gamertag;
+    ImGui::TextWrapped("%s invited you to a voice party", who.c_str());
+    if (ImGui::Button(std::format("Accept##{}", inv.party_id).c_str())) {
+      party->Join(inv.party_id);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(std::format("Decline##{}", inv.party_id).c_str())) {
+      party->Decline(inv.party_id);
+    }
+    ImGui::Separator();
+  }
+
+  if (party->InParty()) {
+    const auto members = party->GetMembers();
+    ImGui::Text("Party voice (%zu)", members.size());
+    for (const auto& m : members) {
+      const std::string tag =
+          m.gamertag.empty() ? fmt::format("{:016X}", m.xuid) : m.gamertag;
+      ImGui::BulletText("%s", tag.c_str());
+    }
+    if (ImGui::Button("Leave Party")) {
+      party->Leave();
+    }
+    ImGui::Separator();
+  }
+}
+
+// Small filled "online" dot on the current text line, then advance past it.
+static void xeDrawPresenceDot(bool online) {
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const float line_h = ImGui::GetTextLineHeight();
+  const float r = line_h * 0.30f;
+  const ImVec2 pos = ImGui::GetCursorScreenPos();
+  const ImU32 col =
+      online ? IM_COL32(60, 220, 90, 255) : IM_COL32(96, 96, 96, 255);
+  dl->AddCircleFilled(ImVec2(pos.x + r, pos.y + line_h * 0.5f), r, col);
+  ImGui::SetCursorScreenPos(ImVec2(pos.x + r * 2.0f + 8.0f, pos.y));
+}
+
+// One server-authoritative friend, drawn in the SAME presentation as the legacy
+// config friend row (xeDrawFriendContent) -- gamerpic tile, gamertag, title /
+// rich-presence status, and a button group -- but every action is wired to the
+// server (FriendsManager) and the netplay party (PartyManager) instead of the
+// config/profile friend model. Kept separate from xeDrawFriendContent because
+// that row is shared with the gamercard UI and hard-wired to the config model.
+static void xeDrawServerFriendRow(
+    xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
+    const FriendEntry& f,
+    const std::map<uint64_t, std::shared_ptr<xe::ui::ImmediateTexture>>&
+        gamerpics) {
+  const uint32_t user_index =
+      kernel_state()->xam_state()->GetUserIndexAssignedToProfileFromXUID(
+          profile->GetLogonXUID());
+  const std::string xuid_str = fmt::format("{:016X}", f.xuid);
+
+  // Gamerpic if we've fetched it for this XUID, else the loading tile.
+  xe::ui::ImmediateTexture* pic = imgui_drawer->GetLoadingTileIcon();
+  if (auto it = gamerpics.find(f.xuid);
+      it != gamerpics.end() && it->second) {
+    pic = it->second.get();
+  }
+  ImGui::Image(reinterpret_cast<ImTextureID>(pic),
+               xe::ui::default_image_icon_size);
+  ImGui::SameLine();
+
+  ImGui::BeginGroup();
+  // Name + presence dot.
+  xeDrawPresenceDot(f.online());
+  const std::string tag = f.gamertag.empty() ? xuid_str : f.gamertag;
+  ImGui::TextUnformatted(tag.c_str());
+
+  const bool same_title =
+      f.title_id && f.title_id == kernel_state()->title_id();
+  if (!f.rich_presence.empty()) {
+    ImGui::TextWrapped("Status: %s", f.rich_presence.c_str());
+  } else if (f.title_id) {
+    if (same_title) {
+      ImGui::Text("Game: %s", kernel_state()->emulator()->title_name().c_str());
+    } else {
+      ImGui::Text("Title ID: %08X", f.title_id);
+    }
+  } else {
+    ImGui::TextDisabled(f.online() ? "Online" : "Offline");
+  }
+
+  // Actions: Join Session (in-title invite-accept flow) / Invite to Party /
+  // Remove. Join needs the friend to be in a joinable session of this title.
+  float btn_height = 25;
+  float btn_width = (ImGui::GetContentRegionAvail().x * 0.5f) -
+                    (ImGui::GetStyle().ItemSpacing.x * 0.5f);
+  ImVec2 half_width_btn = ImVec2(btn_width, btn_height);
+
+  ImGui::BeginDisabled(f.session_id.empty() || !same_title);
+  if (ImGui::Button(fmt::format("Join Session##{}", xuid_str).c_str(),
+                    half_width_btn)) {
+    X_INVITE_INFO invite = {};
+    invite.xuid_invitee = profile->GetOnlineXUID();
+    invite.xuid_inviter = f.xuid;
+    invite.title_id = kernel_state()->title_id();
+    invite.from_game_invite = false;
+    profile->SetSelfInvite(invite);
+    kernel_state()->BroadcastNotification(kXNotificationLiveInviteAccepted,
+                                          user_index);
+  }
+  ImGui::EndDisabled();
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+    ImGui::SetTooltip(f.session_id.empty()
+                          ? "Not in a joinable session"
+                          : (same_title ? "Join gaming session"
+                                        : "Playing a different game"));
+  }
+
+  ImGui::SameLine();
+  if (ImGui::Button(fmt::format("Remove##{}", xuid_str).c_str(),
+                    half_width_btn)) {
+    FriendsManager::Get()->Remove(f.xuid);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Remove Friend");
+  }
+
+  // Invite to Party -- the netplay voice party (decoupled from game sessions).
+  PartyManager* party = PartyManager::Get();
+  const bool already = party->IsMember(f.xuid);
+  ImGui::BeginDisabled(already);
+  if (ImGui::Button(fmt::format("Invite to Party##{}", xuid_str).c_str())) {
+    party->Invite(f.xuid);
+  }
+  ImGui::EndDisabled();
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+    ImGui::SetTooltip(already ? "Already in your party"
+                              : "Invite to your voice party");
+  }
+  ImGui::EndGroup();
+
+  // Right-click: copy gamertag / XUID (mirrors the legacy row).
+  if (ImGui::BeginPopupContextItem(
+          fmt::format("Friend Menu##{}", xuid_str).c_str())) {
+    if (ImGui::MenuItem("Copy Gamertag")) {
+      ImGui::SetClipboardText(tag.c_str());
+    }
+    if (ImGui::MenuItem("Copy XUID")) {
+      ImGui::SetClipboardText(xuid_str.c_str());
+    }
+    ImGui::EndPopup();
+  }
+}
+
+// Server "Add Friend" control: request by gamertag OR XUID, with a right-click
+// Paste (mirrors the legacy add-friend / search boxes, which imgui's Ctrl+V
+// doesn't cover here). Sits above the friends list.
+static void xeDrawServerAddFriend() {
+  FriendsManager* fm = FriendsManager::Get();
+  static char add_buf[64] = {0};
+
+  ImGui::TextUnformatted("Add friend (gamertag or XUID):");
+  ImGui::SetNextItemWidth(-60.0f);
+  const bool submit_enter =
+      ImGui::InputText("##addfriend", add_buf, sizeof(add_buf),
+                       ImGuiInputTextFlags_EnterReturnsTrue);
+  if (ImGui::IsItemFocused() &&
+      ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceDown, false)) {
+    ImGui::OpenPopup("##AddFriendCtx");
+  }
+  if (ImGui::BeginPopupContextItem("##AddFriendCtx")) {
+    if (ImGui::MenuItem("Paste")) {
+      const std::string clip = ImGui::GetClipboardText();
+      if (!clip.empty()) {
+        std::memset(add_buf, 0, sizeof(add_buf));
+        strncpy(add_buf, clip.c_str(), sizeof(add_buf) - 1);
+      }
+    }
+    if (ImGui::MenuItem("Clear")) {
+      std::memset(add_buf, 0, sizeof(add_buf));
+    }
+    ImGui::EndPopup();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Right Click/Gamepad A to paste");
+  }
+  ImGui::SameLine();
+  const bool submit = ImGui::Button("Send##addfriend") || submit_enter;
+  if (submit) {
+    std::string s(add_buf);
+    const size_t b = s.find_first_not_of(" \t");
+    const size_t e = s.find_last_not_of(" \t");
+    s = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+    if (!s.empty()) {
+      const bool is_xuid =
+          s.size() == 16 &&
+          s.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+      if (is_xuid) {
+        fm->RequestByXuid(std::strtoull(s.c_str(), nullptr, 16));
+      } else {
+        fm->RequestByGamertag(s);
+      }
+      add_buf[0] = '\0';
+    }
+  }
+}
+
+// Netplay "Requests" tab: incoming (accept/decline) + outgoing (cancel).
+static void xeDrawRequestsTab() {
+  FriendsManager* fm = FriendsManager::Get();
+  const auto incoming = fm->GetIncoming();
+  const auto outgoing = fm->GetOutgoing();
+
+  ImGui::Text("Incoming (%zu)", incoming.size());
+  if (incoming.empty()) {
+    ImGui::TextDisabled("  (none)");
+  }
+  for (const auto& r : incoming) {
+    const std::string who =
+        r.gamertag.empty() ? fmt::format("{:016X}", r.xuid) : r.gamertag;
+    ImGui::TextUnformatted(who.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton(fmt::format("Accept##{:016X}", r.xuid).c_str())) {
+      fm->Accept(r.xuid);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton(fmt::format("Decline##{:016X}", r.xuid).c_str())) {
+      fm->Decline(r.xuid);
+    }
+  }
+
+  ImGui::Separator();
+  ImGui::Text("Outgoing (%zu)", outgoing.size());
+  if (outgoing.empty()) {
+    ImGui::TextDisabled("  (none)");
+  }
+  for (const auto& r : outgoing) {
+    const std::string who =
+        r.gamertag.empty() ? fmt::format("{:016X}", r.xuid) : r.gamertag;
+    ImGui::TextUnformatted(who.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton(fmt::format("Cancel##{:016X}", r.xuid).c_str())) {
+      fm->Cancel(r.xuid);
+    }
+  }
+}
+
+// Netplay "Recent" tab: players you've recently shared a session with (server
+// /recent), an add-friend feeder. Anyone already a friend or with a pending
+// request either way is filtered out; each remaining row can send a request.
+static void xeDrawRecentTab() {
+  RecentManager* rm = RecentManager::Get();
+  rm->Refresh();  // throttled; only actually fetches when stale
+  const auto recent = rm->GetRecent();
+  FriendsManager* fm = FriendsManager::Get();
+
+  // Hide anyone already a friend or mid-request (either direction).
+  std::set<uint64_t> known;
+  for (const auto& f : fm->GetFriends()) {
+    known.insert(f.xuid);
+  }
+  for (const auto& r : fm->GetIncoming()) {
+    known.insert(r.xuid);
+  }
+  for (const auto& r : fm->GetOutgoing()) {
+    known.insert(r.xuid);
+  }
+
+  ImGui::TextDisabled("Players you've recently shared a session with.");
+  static bool hide_existing = true;
+  ImGui::Checkbox("Hide players already in your friends / requests",
+                  &hide_existing);
+  ImGui::Separator();
+
+  size_t shown = 0;
+  for (const auto& rp : recent) {
+    const bool is_known = known.count(rp.xuid) != 0;
+    if (hide_existing && is_known) {
+      continue;
+    }
+    ++shown;
+    xeDrawPresenceDot(rp.online);
+    const std::string tag =
+        rp.gamertag.empty() ? fmt::format("{:016X}", rp.xuid) : rp.gamertag;
+    if (rp.encounter_count > 1) {
+      ImGui::Text("%s  (%u sessions)", tag.c_str(), rp.encounter_count);
+    } else {
+      ImGui::TextUnformatted(tag.c_str());
+    }
+    ImGui::SameLine();
+    if (is_known) {
+      ImGui::TextDisabled("(friend / pending)");
+    } else if (ImGui::SmallButton(
+                   fmt::format("Add Friend##rec{:016X}", rp.xuid).c_str())) {
+      fm->RequestByXuid(rp.xuid);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton(fmt::format("Remove##recdel{:016X}", rp.xuid).c_str())) {
+      rm->Remove(rp.xuid);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Remove from recent players (don't suggest this person)");
+    }
+  }
+
+  if (recent.empty()) {
+    ImGui::TextDisabled("  (no recent players yet)");
+  } else if (shown == 0) {
+    ImGui::TextDisabled("  (everyone recent is already a friend)");
+  }
+
+  if (!recent.empty()) {
+    ImGui::Separator();
+    if (ImGui::SmallButton("Clear Recent")) {
+      rm->Clear();
+    }
+  }
+}
+
+// Netplay panel drawn atop the Friends modal: Party / Friends / Requests tabs.
+// The Requests tab label carries an unacked-incoming count so pending requests
+// are visible without opening it.
+static void xeDrawNetplayPanel() {
+  const size_t incoming = FriendsManager::Get()->IncomingCount();
+  if (ImGui::BeginTabBar("##netplay_tabs")) {
+    if (ImGui::BeginTabItem("Party")) {
+      xeDrawPartyPanel();
+      ImGui::EndTabItem();
+    }
+    // Fixed ### id so the changing count doesn't reset the tab's imgui state.
+    const std::string req_label =
+        incoming ? fmt::format("Requests ({})###req", incoming)
+                 : std::string("Requests###req");
+    if (ImGui::BeginTabItem(req_label.c_str())) {
+      xeDrawRequestsTab();
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Recent")) {
+      xeDrawRecentTab();
+      ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+  }
+  ImGui::Separator();
+}
+
 bool xeDrawFriendsContent(
     xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile,
     ui::FriendsContentArgs& args,
@@ -1350,6 +1721,8 @@ bool xeDrawFriendsContent(
         ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_GamepadFaceRight, false)) {
       ImGui::CloseCurrentPopup();
     }
+
+    xeDrawNetplayPanel();
 
     const float window_width = ImGui::GetContentRegionAvail().x;
 
@@ -1437,87 +1810,67 @@ bool xeDrawFriendsContent(
     ImGui::Spacing();
     ImGui::Spacing();
 
-    if (ImGui::Button("Add Friend",
-                      ImVec2(ImGui::GetContentRegionAvail().x, btn_height))) {
-      args.add_friend_args.add_friend_open = true;
-      ImGui::OpenPopup("Add Friend");
-    }
-
-    ImGui::BeginDisabled(!profile->GetFriendsCount());
-    if (ImGui::Button("Refresh", half_width_btn)) {
-      args.refresh_presence = true;
-    }
-    ImGui::EndDisabled();
-
-    ImGui::SameLine();
-
-    ImGui::BeginDisabled(!profile->GetFriendsCount());
-    if (ImGui::Button("Remove All", half_width_btn)) {
-      ImGui::OpenPopup("Remove All Friends");
-    }
-    ImGui::EndDisabled();
-
-    xeDrawAddFriend(imgui_drawer, profile, args.add_friend_args);
-
-    if (args.add_friend_args.added_friend) {
-      args.refresh_presence = true;
-      args.add_friend_args.added_friend = false;
-    }
+    // Server-authoritative add-friend (gamertag or XUID, with paste). Replaces
+    // the legacy config Add Friend / Refresh / Remove All controls.
+    xeDrawServerAddFriend();
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
-    for (uint32_t index = 0; auto& presence : *presences) {
-      bool filter_gamertags =
-          args.filter.PassFilter(presence.Gamertag().c_str());
-      bool filter_xuid = args.filter.PassFilter(
-          fmt::format("{:016X}", presence.XUID().get()).c_str());
+    // The friends list is now the server-authoritative one (FriendsManager),
+    // rendered in the legacy presentation via xeDrawServerFriendRow. The search
+    // box + filter checkboxes still apply.
+    const auto server_friends = FriendsManager::Get()->GetFriends();
 
-      if (filter_gamertags || filter_xuid) {
-        if (profile->GetOnlineXUID() == presence.XUID()) {
-          continue;
-        }
-
-        const bool same_title =
-            presence.TitleIDValue() &&
-            presence.TitleIDValue() == kernel_state()->title_id();
-
-        if (args.filter_joinable && (!presence.SessionID() || !same_title)) {
-          continue;
-        }
-
-        if (args.filter_title && !same_title) {
-          continue;
-        }
-
-        if (args.filter_offline &&
-            (!presence.State() || !IsValidXUID(presence.XUID()))) {
-          continue;
-        }
-
-        std::shared_ptr<xe::ui::ImmediateTexture> gamerpic = {};
-
-        if (immediate_gamerpics.contains(presence.XUID())) {
-          gamerpic = immediate_gamerpics.at(presence.XUID());
-        }
-
-        uint64_t selected_xuid_ = 0;
-        uint64_t removed_xuid_ = 0;
-        xeDrawFriendContent(imgui_drawer, profile, gamerpic, presence,
-                            &selected_xuid_, &removed_xuid_);
-
-        if (removed_xuid_) {
-          presences->erase(presences->begin() + index);
-          removed_xuid_ = 0;
-        }
-
-        ImGui::Separator();
-        ImGui::Spacing();
-        ImGui::Spacing();
+    // Gamerpics for the server friends. Owned here so EVERY host of this content
+    // (FriendsUI, ManagerDialog, ...) gets them -- previously each host fetched
+    // gamerpics for its CONFIG friends, which are empty post fresh-start, so
+    // server friends only ever showed the loading tile. One CDN batch per set
+    // change (no fetch in flight), merged into immediate_gamerpics by XUID.
+    {
+      std::set<uint64_t> want;
+      for (const auto& f : server_friends) {
+        want.insert(f.xuid);
       }
-
-      index++;
+      if (!want.empty() && want != args.gamerpic_xuids &&
+          !args.gamerpic_fetch.valid()) {
+        args.gamerpic_xuids = want;
+        args.gamerpic_fetch =
+            kernel_state()->GetXboxLiveAPI()->GetGamerpicsForXuidsAsync(
+                want, imgui_drawer);
+      }
+      if (args.gamerpic_fetch.valid() &&
+          args.gamerpic_fetch.wait_for(std::chrono::seconds(0)) ==
+              std::future_status::ready) {
+        immediate_gamerpics.merge(args.gamerpic_fetch.get());
+      }
+    }
+    ImGui::Text("Friends (%zu)", server_friends.size());
+    if (server_friends.empty()) {
+      ImGui::TextDisabled("No friends yet -- add one above.");
+    }
+    for (const auto& f : server_friends) {
+      const std::string xuid_hex = fmt::format("{:016X}", f.xuid);
+      if (!args.filter.PassFilter(f.gamertag.c_str()) &&
+          !args.filter.PassFilter(xuid_hex.c_str())) {
+        continue;
+      }
+      const bool same_title =
+          f.title_id && f.title_id == kernel_state()->title_id();
+      if (args.filter_joinable && (f.session_id.empty() || !same_title)) {
+        continue;
+      }
+      if (args.filter_title && !same_title) {
+        continue;
+      }
+      if (args.filter_offline && !f.online()) {
+        continue;
+      }
+      xeDrawServerFriendRow(imgui_drawer, profile, f, immediate_gamerpics);
+      ImGui::Separator();
+      ImGui::Spacing();
+      ImGui::Spacing();
     }
 
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));

@@ -200,7 +200,10 @@ X_HRESULT XgiApp::ExecuteDispatchMessage(uint32_t message, uint32_t buffer_ptr,
         return X_E_FAIL;
       }
 
-      return session->MigrateHost(data);
+      XSession::LogSessionCensus(kernel_state(), "migrate-host");
+      const auto migrate_result = session->MigrateHost(data);
+      XSession::LogSessionCensus(kernel_state(), "migrate-host-done");
+      return migrate_result;
     }
     case 0x000B0021: {
       assert_true(!buffer_length ||
@@ -442,6 +445,7 @@ X_HRESULT XgiApp::ExecuteDispatchMessage(uint32_t message, uint32_t buffer_ptr,
           data->flags, data->session_info_ptr, data->nonce_ptr);
 
       kernel_state()->GetXboxLiveAPI()->clearXnaddrCache();
+      XSession::LogSessionCensus(kernel_state(), "create");
       return result;
     }
     case 0x000B0011: {
@@ -461,6 +465,7 @@ X_HRESULT XgiApp::ExecuteDispatchMessage(uint32_t message, uint32_t buffer_ptr,
 
       const X_RESULT result = session->DeleteSession(data);
       session->ReleaseHandle();
+      XSession::LogSessionCensus(kernel_state(), "delete");
 
       return result;
     }
@@ -480,6 +485,7 @@ X_HRESULT XgiApp::ExecuteDispatchMessage(uint32_t message, uint32_t buffer_ptr,
 
       const auto result = session->JoinSession(data);
       kernel_state()->GetXboxLiveAPI()->clearXnaddrCache();
+      XSession::LogSessionCensus(kernel_state(), "join");
       return result;
     }
     case 0x000B0013: {
@@ -499,6 +505,7 @@ X_HRESULT XgiApp::ExecuteDispatchMessage(uint32_t message, uint32_t buffer_ptr,
 
       const auto result = session->LeaveSession(data);
       kernel_state()->GetXboxLiveAPI()->clearXnaddrCache();
+      XSession::LogSessionCensus(kernel_state(), "leave");
 
       return result;
     }

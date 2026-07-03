@@ -47,6 +47,9 @@ DEFINE_bool(log_to_logcat, true, "Write log output to Android Logcat.",
             "Logging");
 #else
 DEFINE_path(log_file, "", "Logs are written to the given file", "Logging");
+
+// Resolved log file path (set by InitializeLogging), for GetLogFilePath().
+static std::filesystem::path log_file_path_;
 DEFINE_bool(log_to_stdout, true, "Write log output to stdout", "Logging");
 DEFINE_bool(log_to_debugprint, false, "Dump the log to DebugPrint.", "Logging");
 #endif  // XE_PLATFORM_ANDROID
@@ -75,6 +78,7 @@ Logger* logger_ = nullptr;
 
 struct LogLine {
   size_t buffer_length;
+  uint64_t timestamp_ms;  // wall-clock (system_clock) ms, captured at log time
   uint32_t thread_id;
   uint16_t _pad_0;  // (2b) padding
   bool terminate;
@@ -320,6 +324,12 @@ class Logger {
           i += needed_count;
 
           if (line.prefix_char) {
+            // Unix epoch (UTC) milliseconds ahead of the prefix so log lines can
+            // be correlated across instances / packet captures.
+            char ts_prefix[24];
+            auto ts_res = fmt::format_to_n(ts_prefix, sizeof(ts_prefix), "{} ",
+                                           line.timestamp_ms);
+            Write(ts_prefix, static_cast<size_t>(ts_res.out - ts_prefix));
             char prefix[] = {
                 line.prefix_char,
                 '>',
@@ -422,6 +432,10 @@ class Logger {
     line.thread_id = thread_id;
     line.prefix_char = prefix_char;
     line.terminate = terminate;
+    line.timestamp_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
 
     rb.Write(&line, sizeof(LogLine));
     if (buffer_length) {
@@ -429,6 +443,51 @@ class Logger {
     }
 
     claim_strategy_.publish(range);
+  }
+
+  // Non-blocking append: claim ring-buffer space WITHOUT waiting. If the buffer
+  // is full, drop the line (return false) instead of spin-waiting like
+  // AppendLine -- for callers that must never stall on logging (e.g. a network
+  // service thread). try_claim may grant FEWER blocks than requested; the
+  // granted slots are still claimed and MUST be published or the consumer
+  // stalls, so we truncate the payload to fit. The LogLine header is < one
+  // block, so at least the header always fits. Returns true only if the whole
+  // line was queued (false = dropped or truncated).
+  bool TryAppendLine(uint32_t thread_id, const char prefix_char,
+                     const char* buffer_data, size_t buffer_length) {
+    const size_t want = BlockCount(sizeof(LogLine) + buffer_length);
+
+    dp::sequence_range range;
+    if (!claim_strategy_.try_claim(want, range) || range.size() == 0) {
+      return false;  // no room -> drop, nothing claimed
+    }
+
+    const size_t granted_bytes = range.size() * kBlockSize;
+    const size_t avail_payload = granted_bytes - sizeof(LogLine);
+    const size_t write_len =
+        buffer_length < avail_payload ? buffer_length : avail_payload;
+
+    RingBuffer rb(buffer_, kBufferSize);
+    rb.set_write_offset(BlockOffset(range.first()));
+    rb.set_read_offset(BlockOffset(range.end()));
+
+    LogLine line = {};
+    line.buffer_length = write_len;
+    line.thread_id = thread_id;
+    line.prefix_char = prefix_char;
+    line.terminate = false;
+    line.timestamp_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+
+    rb.Write(&line, sizeof(LogLine));
+    if (write_len) {
+      rb.Write(buffer_data, write_len);
+    }
+
+    claim_strategy_.publish(range);
+    return write_len == buffer_length;
   }
 };
 
@@ -449,9 +508,11 @@ void InitializeLogging(const std::string_view app_name) {
     auto file_name = fmt::format("{}.log", app_name);
     auto file_path = xe::filesystem::GetExecutableFolder() / file_name;
     log_file = xe::filesystem::OpenFile(file_path, "wt");
+    log_file_path_ = file_path;
   } else {
     xe::filesystem::CreateParentFolder(cvars::log_file);
     log_file = xe::filesystem::OpenFile(cvars::log_file, "wt");
+    log_file_path_ = cvars::log_file;
   }
   logger_->AddLogSink(std::make_unique<FileLogSink>(log_file, true));
 
@@ -481,6 +542,8 @@ void FlushLog() {
   xe::threading::Sleep(10ms);
   logger_->FlushAllSinks();
 }
+
+std::filesystem::path GetLogFilePath() { return log_file_path_; }
 
 static int g_saved_loglevel = static_cast<int>(LogLevel::Disabled);
 void logging::ToggleLogLevel() {
@@ -517,6 +580,16 @@ void logging::AppendLogLine(LogLevel log_level, const char prefix_char,
   }
   logger_->AppendLine(xe::threading::current_thread_id(), prefix_char,
                       str.data(), str.size());
+}
+
+bool logging::AppendLogLineNoBlock(LogLevel log_level, const char prefix_char,
+                                   const std::string_view str,
+                                   uint32_t log_mask) {
+  if (!logger_ || !ShouldLog(log_level, log_mask) || !str.size()) {
+    return false;
+  }
+  return logger_->TryAppendLine(xe::threading::current_thread_id(), prefix_char,
+                                str.data(), str.size());
 }
 
 void FatalError(const std::string_view str) {

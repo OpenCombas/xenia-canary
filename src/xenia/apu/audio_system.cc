@@ -9,11 +9,20 @@
 
 #include "xenia/apu/audio_system.h"
 
+#include <chrono>
+#include <cstring>
+#include <thread>
+#include <vector>
+
 #include "xenia/apu/apu_flags.h"
 #include "xenia/apu/audio_driver.h"
+#include "xenia/apu/voice_codec.h"
+#include "xenia/apu/voice_input.h"
+#include "xenia/apu/voice_output.h"
 #include "xenia/apu/xma_decoder.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
@@ -22,6 +31,21 @@
 #include "xenia/base/threading.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/kernel_state.h"
+
+DEFINE_bool(
+    voice_loopback, false,
+    "Voice side-channel: local mic loopback -- capture the host mic, run it "
+    "through the selected voice_codec (encode+decode), and play it back so you "
+    "hear yourself. A no-netplay self-test of the mic + codec + output path. "
+    "Takes effect on restart.",
+    "Live");
+
+DEFINE_string(
+    voice_codec, "opus",
+    "Voice side-channel codec: 'opus' (wideband, default) or 'pcm' (raw "
+    "passthrough, debug). Unavailable codecs fall back to pcm. Takes effect on "
+    "restart.",
+    "Live");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -94,7 +118,42 @@ X_STATUS AudioSystem::Setup(kernel::KernelState* kernel_state) {
   worker_thread_->set_name("Audio Worker");
   worker_thread_->Create();
 
+  if (cvars::voice_loopback) {
+    voice_loopback_running_ = true;
+    voice_loopback_thread_ = std::thread(&AudioSystem::VoiceLoopbackThread, this);
+  }
+
   return X_STATUS_SUCCESS;
+}
+
+void AudioSystem::VoiceLoopbackThread() {
+  auto codec = VoiceCodec::Create(cvars::voice_codec);
+  const uint32_t rate = codec->sample_rate();
+  const size_t frame = codec->frame_samples();
+  VoiceInput in;
+  VoiceOutput out;
+  in.Initialize(rate, 1);
+  out.Initialize(rate, 1);
+  XELOGI("[voice] loopback started: codec={} {} Hz, {}-sample frames",
+         codec->name(), rate, frame);
+  std::vector<int16_t> pcm(frame);
+  std::vector<int16_t> dec(frame * 4);
+  std::vector<uint8_t> enc(8192);
+  const auto frame_dur =
+      std::chrono::microseconds(static_cast<int64_t>(frame) * 1000000 / rate);
+  auto next = std::chrono::steady_clock::now();
+  while (voice_loopback_running_.load(std::memory_order_relaxed)) {
+    in.Read(pcm.data(), frame);
+    const size_t n = codec->Encode(pcm.data(), frame, enc.data(), enc.size());
+    const size_t m =
+        n ? codec->Decode(enc.data(), n, dec.data(), dec.size()) : 0;
+    if (m) {
+      out.SubmitPcm(dec.data(), m);
+    }
+    next += frame_dur;
+    std::this_thread::sleep_until(next);
+  }
+  XELOGI("[voice] loopback stopped");
 }
 
 void AudioSystem::WorkerThreadMain() {
@@ -172,6 +231,11 @@ int AudioSystem::FindFreeClient() {
 void AudioSystem::Initialize() {}
 
 void AudioSystem::Shutdown() {
+  if (voice_loopback_running_.exchange(false)) {
+    if (voice_loopback_thread_.joinable()) {
+      voice_loopback_thread_.join();
+    }
+  }
   worker_running_ = false;
   shutdown_event_->Set();
   if (worker_thread_) {

@@ -206,6 +206,10 @@ Emulator::~Emulator() {
   ExceptionHandler::Uninstall(Emulator::ExceptionCallbackThunk, this);
 }
 
+uint32_t Emulator::main_thread_id() {
+  return main_thread_ ? main_thread_->thread_id() : 0;
+}
+
 X_STATUS Emulator::Setup(
     ui::Window* display_window, ui::ImGuiDrawer* imgui_drawer,
     bool require_cpu_backend,
@@ -226,7 +230,7 @@ X_STATUS Emulator::Setup(
   // We could reset this with save state data/constant value to help replays.
   Clock::set_guest_system_time_base(Clock::QueryHostSystemTime());
   // This can be adjusted dynamically, as well.
-  Clock::set_guest_time_scalar(cvars::time_scalar);
+  Clock::set_guest_time_scalar(1);
 
   // Before we can set thread affinity we must enable the process to use all
   // logical processors.

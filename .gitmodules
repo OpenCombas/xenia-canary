@@ -112,3 +112,15 @@
 [submodule "third_party/wolfssl"]
 	path = third_party/wolfssl
 	url = https://github.com/wolfssl/wolfssl.git
+[submodule "third_party/GameNetworkingSockets"]
+	path = third_party/GameNetworkingSockets
+	url = https://github.com/OpenCombas/GameNetworkingSockets.git
+[submodule "third_party/protobuf"]
+	path = third_party/protobuf
+	url = https://github.com/protocolbuffers/protobuf.git
+[submodule "third_party/opus"]
+	path = third_party/opus
+	url = https://github.com/xiph/opus
+[submodule "third_party/rnnoise"]
+	path = third_party/rnnoise
+	url = https://github.com/OpenCombas/rnnoise

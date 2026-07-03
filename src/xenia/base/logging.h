@@ -12,6 +12,7 @@
 
 #include <cstdarg>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -77,6 +78,11 @@ void InitializeLogging(const std::string_view app_name);
 void ShutdownLogging();
 void FlushLog();
 
+// Path of the file the logger is writing to (resolved at InitializeLogging:
+// cvars::log_file, else <exe dir>/<app>.log). Empty if logging to a file isn't
+// active. Used by the log-upload diagnostic.
+std::filesystem::path GetLogFilePath();
+
 namespace logging {
 
 constexpr char kPrefixCharError = '!';
@@ -129,6 +135,15 @@ XE_FORCEINLINE static void AppendLogLineFormat(uint32_t log_src_mask,
 void AppendLogLine(LogLevel log_level, const char prefix_char,
                    const std::string_view str,
                    uint32_t log_mask = LogSrc::Uncategorized);
+
+// Non-blocking variant: if the log ring buffer is full, DROP the line instead of
+// spin-waiting for space (the normal AppendLogLine path). Returns true if the
+// line was fully queued, false if it was dropped or truncated. For
+// latency-critical producers -- e.g. a network service thread -- that must never
+// stall on logging even when another thread is flooding the log at debug level.
+bool AppendLogLineNoBlock(LogLevel log_level, const char prefix_char,
+                          const std::string_view str,
+                          uint32_t log_mask = LogSrc::Uncategorized);
 
 template <LogLevel ll>
 struct LoggerBatch {

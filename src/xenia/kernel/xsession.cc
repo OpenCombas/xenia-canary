@@ -8,15 +8,56 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <map>
 #include <ranges>
+#include <set>
+#include <thread>
 
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/util/object_table.h"
 #include "xenia/kernel/xsession.h"
 #include "xenia/ui/imgui_host_notification.h"
 
 DECLARE_bool(upnp);
+
+DEFINE_bool(
+    session_diag, true,
+    "Netplay diagnostics: on each session create/join/leave/delete/migrate, log "
+    "a census of every live XSession object (id, flags, host, members) and WARN "
+    "when more than one peer-network session is live, or any player is a member "
+    "of more than one live session -- the 'ended up in multiple sessions' "
+    "failure mode (e.g. a search that couldn't match the real lobby and "
+    "self-hosted a parallel one). Default on while we chase multi-session "
+    "disconnects; low volume (fires only on session lifecycle events).",
+    "Live");
+
+DEFINE_int32(
+    session_search_populate_timeout_ms, 5000,
+    "Netplay: when a session search finds candidate lobbies that exist but "
+    "haven't populated their properties yet (a squad-mate's just-created lobby "
+    "mid-setup), wait up to this many milliseconds -- re-polling those "
+    "candidates -- for them to become identifiable before failing the search. "
+    "Failing forces the title to self-host a separate (parallel) lobby, so this "
+    "lets a joiner converge on the real lobby instead. Only property-less "
+    "candidates are waited on; an identified non-match is never joined. 0 "
+    "disables the wait (legacy behavior).",
+    "Live");
+
+DEFINE_bool(
+    session_search_log_criteria, true,
+    "Netplay diagnostics: for the no-XLAST session-search filter, log every "
+    "per-criterion comparison (each searched context/property vs the session's "
+    "stored value, the operator used, and match/no-match) for each candidate "
+    "session. This is the ground truth for mapping which operator each "
+    "(proc_index, property/context id) uses. Default on (paired with "
+    "session_diag) while we chase the session-filter / multi-session "
+    "disconnects; verbose but only on searches. Set false for quiet logs.",
+    "Live");
 
 namespace xe {
 namespace kernel {
@@ -37,6 +78,75 @@ X_STATUS XSession::Initialize() {
   guest_object->handle = handle();
   // Based on what is in XAM it seems like size of this object is only 4 bytes.
   return X_STATUS_SUCCESS;
+}
+
+void XSession::LogSessionCensus(KernelState* kernel_state, const char* event) {
+  if (!cvars::session_diag || !kernel_state) {
+    return;
+  }
+  const auto sessions =
+      kernel_state->object_table()->GetObjectsByType<XSession>(
+          XObject::Type::Session);
+
+  std::map<uint64_t, uint32_t> member_session_count;  // xuid -> # live sessions
+  uint32_t live = 0, live_peer_net = 0;
+  for (const auto& s : sessions) {
+    if (!s || s->IsDeleted()) {
+      continue;
+    }
+    ++live;
+    if (s->local_details_.Flags.get() & SessionFlags::PEER_NETWORK) {
+      ++live_peer_net;
+    }
+    std::set<uint64_t> in_this;  // dedupe a xuid within one session
+    for (const auto& [xuid, m] : s->local_members_) {
+      in_this.insert(xuid);
+    }
+    for (const auto& [xuid, m] : s->remote_members_) {
+      in_this.insert(xuid);
+    }
+    for (uint64_t x : in_this) {
+      member_session_count[x]++;
+    }
+  }
+
+  XELOGI("[sessdiag] {}: {} live session(s), {} peer-network", event, live,
+         live_peer_net);
+  for (const auto& s : sessions) {
+    if (!s) {
+      continue;
+    }
+    std::string members;
+    for (const auto& [xuid, m] : s->local_members_) {
+      members += fmt::format("L:{:016X} ", xuid);
+    }
+    for (const auto& [xuid, m] : s->remote_members_) {
+      members += fmt::format("R:{:016X} ", xuid);
+    }
+    XELOGI(
+        "[sessdiag]   h={:08X} id={:016X} flags={:08X} [{}{}{}{}] owner={:016X} "
+        "members={{ {}}}",
+        s->handle(), s->GetSessionID(), s->local_details_.Flags.get(),
+        s->IsCreated() ? "C" : "-", s->IsHost() ? "H" : "-",
+        s->IsMigrted() ? "M" : "-", s->IsDeleted() ? "D" : "-",
+        s->GetOwnerXUID(), members);
+  }
+
+  // The smoking guns: the local client (or any peer) present in >1 live session,
+  // and/or more than one concurrent peer-network session.
+  for (const auto& [xuid, n] : member_session_count) {
+    if (n > 1) {
+      XELOGW("[sessdiag] WARN: player {:016X} is a member of {} live sessions "
+             "at '{}'",
+             xuid, n, event);
+    }
+  }
+  if (live_peer_net > 1) {
+    XELOGW(
+        "[sessdiag] WARN: {} concurrent peer-network sessions at '{}' -- client "
+        "is in multiple sessions",
+        live_peer_net, event);
+  }
 }
 
 X_RESULT XSession::CreateSession(uint32_t user_index, uint8_t public_slots,
@@ -925,17 +1035,45 @@ X_RESULT XSession::FlushStats() {
     }
   }
 
-  // TODO: Check who flushes stats each peer or just host?
-  if (IsHost()) {
+  // Previously host-only, which silently dropped every non-host player's
+  // career stats: each console writes its OWN player's stat views, but only the
+  // host ever uploaded, so the boards ended up ranking hosting frequency rather
+  // than skill. Measured -- a pilot's 14-view write was logged locally and no
+  // matching row ever reached the backend.
+  //
+  // Every console now flushes, but only for players it is authoritative for.
+  // A non-host is authoritative for its own signed-in profiles and nothing
+  // else; the host additionally reports rows it holds on behalf of the session
+  // (it writes a one-view arbitration result for every player). Scoping this
+  // way is what makes the change safe for the Sum-aggregated columns: those
+  // accumulate per-match deltas server-side, so two consoles reporting the same
+  // player's row would double-count it. Under this rule exactly one console
+  // ever submits a given (xuid, view).
+  const bool is_host = IsHost();
+
+  if (!is_host) {
+    auto* xam = kernel_state()->xam_state();
+    for (auto it = stats_to_flush.begin(); it != stats_to_flush.end();) {
+      if (xam && xam->IsUserSignedIn(it->first)) {
+        ++it;
+      } else {
+        it = stats_to_flush.erase(it);
+      }
+    }
+  }
+
+  if (!stats_to_flush.empty()) {
     const bool flushed = kernel_state()->GetXboxLiveAPI()->SessionFlushStats(
         session_id_, stats_to_flush);
+
+    XELOGI("{}: flushed {} player(s) as {} ({} view-set(s) cached)", __func__,
+           stats_to_flush.size(), is_host ? "host" : "peer",
+           cached_stats_properties_.size());
 
     // If flush is successful then remove cached stats
     if (flushed) {
       for (const auto& [xuid, views] : stats_to_flush) {
-        for (const auto& [view_id, view] : views) {
-          cached_stats_properties_.erase(xuid);
-        }
+        cached_stats_properties_.erase(xuid);
       }
     }
   }
@@ -957,18 +1095,304 @@ X_RESULT XSession::EndSession(XGI_SESSION_STATE* state) {
 
   // The host will report TrueSkill statistics for all players in a session?
 
-  // Post the remaining cached stats
+  // Post the remaining cached stats. Unlike FlushStats this posts everything
+  // still held, INCLUDING the skilled/arbitrated views FlushStats withholds --
+  // which is the only path by which the reserved arbitration view reaches the
+  // backend at all.
+  //
+  // Scoping here is per (xuid, view), NOT per xuid, because the two kinds of
+  // view have opposite requirements:
+  //
+  //  - ARBITRATED / skilled views are a CONSENSUS mechanism. Every member
+  //    reports the result for every player; the service compares those reports
+  //    and only commits the delta if they agree, discarding it otherwise as
+  //    evidence of a tampered session. Suppressing a peer's report of another
+  //    player therefore destroys the very redundancy arbitration exists for --
+  //    so these are submitted by everyone, for everyone.
+  //  - ORDINARY stat views have a single authoritative reporter. A player's own
+  //    console owns its rows; duplicates from a second console would make the
+  //    Sum-aggregated columns accumulate one per-match delta twice.
+  //
+  // So a non-host drops only NON-arbitrated views belonging to other players.
+  //
+  // NOTE this makes duplicate arbitrated rows expected by design. The backend
+  // must reconcile them (compare across members, apply once on agreement, drop
+  // on mismatch) rather than accumulate them -- accumulating would double-count
+  // exactly the columns arbitration is meant to protect.
   if (stats_enabled) {
-    const bool flushed = kernel_state()->GetXboxLiveAPI()->SessionFlushStats(
-        session_id_, cached_stats_properties_);
+    view_properties_unordered_map stats_to_flush = cached_stats_properties_;
 
-    if (flushed) {
-      cached_stats_properties_.clear();
+    if (!IsHost()) {
+      auto* xam = kernel_state()->xam_state();
+      auto* db = emulator()->game_info_database();
+
+      for (auto xuid_it = stats_to_flush.begin();
+           xuid_it != stats_to_flush.end();) {
+        if (xam && xam->IsUserSignedIn(xuid_it->first)) {
+          ++xuid_it;  // our own player: everything stays
+          continue;
+        }
+
+        auto& views = xuid_it->second;
+        for (auto view_it = views.begin(); view_it != views.end();) {
+          const uint32_t view_id = view_it->first;
+          const auto spa_view = db ? db->GetStatsView(view_id) : std::nullopt;
+          const bool arbitrated =
+              IsTrueSkillViewID(view_id) ||
+              (spa_view.has_value() && spa_view.value().view.arbitrated);
+
+          view_it = arbitrated ? std::next(view_it) : views.erase(view_it);
+        }
+
+        xuid_it = views.empty() ? stats_to_flush.erase(xuid_it)
+                                : std::next(xuid_it);
+      }
+    }
+
+    if (!stats_to_flush.empty()) {
+      const bool flushed = kernel_state()->GetXboxLiveAPI()->SessionFlushStats(
+          session_id_, stats_to_flush);
+
+      if (flushed) {
+        for (const auto& [xuid, views] : stats_to_flush) {
+          cached_stats_properties_.erase(xuid);
+        }
+      }
     }
   }
 
   return X_ERROR_SUCCESS;
 }
+
+namespace {
+
+const char* UserDataTypeName(xam::X_USER_DATA_TYPE type) {
+  switch (type) {
+    case xam::X_USER_DATA_TYPE::CONTEXT:
+      return "CONTEXT";
+    case xam::X_USER_DATA_TYPE::INT32:
+      return "INT32";
+    case xam::X_USER_DATA_TYPE::INT64:
+      return "INT64";
+    case xam::X_USER_DATA_TYPE::DOUBLE:
+      return "DOUBLE";
+    case xam::X_USER_DATA_TYPE::WSTRING:
+      return "WSTRING";
+    case xam::X_USER_DATA_TYPE::FLOAT:
+      return "FLOAT";
+    case xam::X_USER_DATA_TYPE::BINARY:
+      return "BINARY";
+    case xam::X_USER_DATA_TYPE::DATETIME:
+      return "DATETIME";
+    default:
+      return "UNSET";
+  }
+}
+
+// Log the guest's search query verbatim. Titles without an XLAST (e.g. the ones
+// this fork targets) give us no server-side query schema, but the fields the
+// game marshals -- proc_index, each context, and each typed property -- are all
+// visible here. Capturing them is the ground truth for reconstructing what a
+// title's matchmaking actually asks for (the comparison operators themselves
+// live server-side and are not present in the title binary).
+void LogSessionSearchQuery(const XGI_SESSION_SEARCH* search_data,
+                           uint32_t num_users,
+                           const xam::XUSER_CONTEXT* contexts,
+                           const xam::XUSER_PROPERTY* properties) {
+  XELOGI(
+      "XSessionSearch query: proc_index={} num_ctx={} num_props={} "
+      "num_results={} num_users={}",
+      static_cast<uint32_t>(search_data->proc_index),
+      static_cast<uint32_t>(search_data->num_ctx),
+      static_cast<uint32_t>(search_data->num_props),
+      static_cast<uint32_t>(search_data->num_results), num_users);
+  for (uint32_t i = 0; i < search_data->num_ctx; i++) {
+    XELOGI("  search ctx[{}]: id=0x{:08X} value=0x{:08X}", i,
+           static_cast<uint32_t>(contexts[i].context_id),
+           static_cast<uint32_t>(contexts[i].value));
+  }
+  for (uint32_t i = 0; i < search_data->num_props; i++) {
+    const uint32_t id = static_cast<uint32_t>(properties[i].property_id);
+    XELOGI(
+        "  search prop[{}]: id=0x{:08X} type={} (type-from-id={}) "
+        "value=0x{:016X}",
+        i, id, UserDataTypeName(properties[i].data.type),
+        UserDataTypeName(xam::UserData::get_type(id)),
+        static_cast<uint64_t>(properties[i].data.data.filetime));
+  }
+}
+
+// Comparison operator for a search property. The classic Xbox matchmaking model
+// (and every context, which is an enum) is equality; a handful of properties in
+// more complex queries (e.g. rank) use an ordering. The real operators are
+// server-side in the missing XLAST, so this is a per-property-id override table:
+// default equality, with confirmed exceptions added as they're identified from
+// the search-query logs above.
+enum class SearchCompareOp {
+  kEqual,
+  kNotEqual,
+  kLess,
+  kLessEqual,
+  kGreater,
+  kGreaterEqual,
+};
+
+SearchCompareOp GetPropertySearchOp(uint32_t property_id) {
+  switch (property_id) {
+    // Squad member-count / capacity, compared as an upper bound: a session
+    // matches when its stored value is <= the searched value. The searcher
+    // passes the squad size cap (e.g. 20), so any squad with room is returned,
+    // while a narrower cap correctly excludes larger squads. This is the only
+    // operator consistent with real Chromehounds squad searches (a session
+    // storing 1 must be returned for a search of 20); everything else is an
+    // enum/boolean and stays equality.
+    case 0x1000003C:
+      return SearchCompareOp::kLessEqual;
+    // Max-rank ceiling: the session stores the highest rank it will admit, and
+    // the game auto-sends the searcher's own rank here. A searcher qualifies only
+    // when the session's ceiling is at or above them, so the match is session >=
+    // search (kGreaterEqual). Confirmed by a live capture (build/logs/
+    // session_searches): a Colonel(18) searcher was wrongly KEPT for a
+    // recruit(1)-max squad under the old lte (1<=18); >= (1>=18) correctly
+    // excludes it while still keeping a colonel(18)-max squad (18>=18).
+    case 0x10000042:
+      return SearchCompareOp::kGreaterEqual;
+    default:
+      return SearchCompareOp::kEqual;
+  }
+}
+
+// Human-readable operator symbol for the per-criterion filter diagnostics.
+const char* SearchOpName(SearchCompareOp op) {
+  switch (op) {
+    case SearchCompareOp::kEqual:
+      return "==";
+    case SearchCompareOp::kNotEqual:
+      return "!=";
+    case SearchCompareOp::kLess:
+      return "<";
+    case SearchCompareOp::kLessEqual:
+      return "<=";
+    case SearchCompareOp::kGreater:
+      return ">";
+    case SearchCompareOp::kGreaterEqual:
+      return ">=";
+    default:
+      return "?";
+  }
+}
+
+// A search value of zero is the title's "unset / don't care" wildcard for a
+// property: the parameter was left blank, so it must not constrain the results.
+// Confirmed against real sessions -- a Chromehounds squad browse passes property
+// 0x20000001=0 while live squad sessions store a non-zero per-session value
+// there, and they must still be returned. Properties only; contexts are enums
+// where 0 is a legitimate value (GAME_MODE 0 == Free Battle).
+bool IsWildcardSearchProperty(const xam::X_USER_DATA& search) {
+  using T = xam::X_USER_DATA_TYPE;
+  switch (search.type) {
+    case T::WSTRING:
+    case T::BINARY:
+      return static_cast<uint32_t>(search.data.binary.size) == 0;
+    case T::INT64:
+    case T::DOUBLE:
+    case T::DATETIME:
+      return static_cast<uint64_t>(search.data.filetime) == 0;
+    default:  // INT32 / FLOAT / CONTEXT-as-property (4-byte)
+      return static_cast<uint32_t>(search.data.u32) == 0;
+  }
+}
+
+// The title advertises a session's matchmaking "hopper" id in one of two paired
+// INT64 slots (0x20000001 primary / 0x20000002 secondary); a given session
+// populates exactly one and leaves the other zero. The conquest browse issues
+// one search per slot, both with a wildcard (0) value, so treating wildcard as
+// an unconditional skip returns the same session for BOTH searches and it shows
+// up twice in the browse list (confirmed: joining either row routes to the same
+// session). For these two ids a wildcard search instead requires the session to
+// actually populate that slot (stored value non-zero), so each session matches
+// only its own slot. Specific-value searches on these ids (the squad rendezvous
+// path) are unaffected -- they never reach the wildcard branch.
+bool IsPairedHopperSlot(uint32_t property_id) {
+  return property_id == 0x20000001 || property_id == 0x20000002;
+}
+
+// Type-aware comparison of a stored session property against a search property,
+// evaluated as (stored <op> search). Fixes the previous u32-only assumption:
+// INT64/DOUBLE/DATETIME compare all 8 bytes with the correct signedness, FLOAT
+// as float, WSTRING/BINARY by their bytes. Contexts are handled separately (they
+// are genuinely always u32).
+bool CompareStoredToSearch(const xam::Property& stored_prop,
+                           const xam::X_USER_DATA& search, SearchCompareOp op,
+                           Memory* memory) {
+  using T = xam::X_USER_DATA_TYPE;
+  const xam::X_USER_DATA& stored = *stored_prop.get_data();
+  if (stored.type != search.type) {
+    return false;
+  }
+
+  // Variable-length data: only equality/inequality is meaningful.
+  if (search.type == T::WSTRING || search.type == T::BINARY) {
+    const auto stored_bytes = stored_prop.get_extended_data();
+    const uint32_t size = static_cast<uint32_t>(search.data.binary.size);
+    bool equal = size == stored_bytes.size();
+    if (equal && size) {
+      const uint32_t ptr = static_cast<uint32_t>(search.data.binary.ptr);
+      equal = ptr && std::memcmp(memory->TranslateVirtual<const uint8_t*>(ptr),
+                                 stored_bytes.data(), size) == 0;
+    }
+    return op == SearchCompareOp::kNotEqual ? !equal : equal;
+  }
+
+  // Fixed-size numeric types: compute a three-way ordering by the real type.
+  int cmp;
+  switch (search.type) {
+    case T::INT64:
+    case T::DATETIME: {
+      const int64_t a = stored.data.s64, b = search.data.s64;
+      cmp = (a < b) ? -1 : (a > b) ? 1 : 0;
+      break;
+    }
+    case T::DOUBLE: {
+      const double a = stored.data.f64, b = search.data.f64;
+      cmp = (a < b) ? -1 : (a > b) ? 1 : 0;
+      break;
+    }
+    case T::FLOAT: {
+      const float a = stored.data.f32, b = search.data.f32;
+      cmp = (a < b) ? -1 : (a > b) ? 1 : 0;
+      break;
+    }
+    case T::INT32: {
+      const int32_t a = stored.data.s32, b = search.data.s32;
+      cmp = (a < b) ? -1 : (a > b) ? 1 : 0;
+      break;
+    }
+    default: {  // CONTEXT / unknown: unsigned 32-bit
+      const uint32_t a = stored.data.u32, b = search.data.u32;
+      cmp = (a < b) ? -1 : (a > b) ? 1 : 0;
+      break;
+    }
+  }
+
+  switch (op) {
+    case SearchCompareOp::kEqual:
+      return cmp == 0;
+    case SearchCompareOp::kNotEqual:
+      return cmp != 0;
+    case SearchCompareOp::kLess:
+      return cmp < 0;
+    case SearchCompareOp::kLessEqual:
+      return cmp <= 0;
+    case SearchCompareOp::kGreater:
+      return cmp > 0;
+    case SearchCompareOp::kGreaterEqual:
+      return cmp >= 0;
+  }
+  return cmp == 0;
+}
+
+}  // namespace
 
 X_RESULT XSession::GetSessions(KernelState* kernel_state,
                                XGI_SESSION_SEARCH* search_data,
@@ -979,33 +1403,6 @@ X_RESULT XSession::GetSessions(KernelState* kernel_state,
     return X_ONLINE_E_SESSION_INSUFFICIENT_BUFFER;
   }
 
-  const auto sessions =
-      kernel_state->GetXboxLiveAPI()->SessionSearch(search_data, num_users);
-
-  const uint32_t session_count = std::min<int32_t>(
-      search_data->num_results, static_cast<uint32_t>(sessions.size()));
-
-  const uint32_t session_ids =
-      kernel_state->memory()->SystemHeapAlloc(session_count * sizeof(XNKID));
-
-  XNKID* session_ids_ptr =
-      kernel_state->memory()->TranslateVirtual<XNKID*>(session_ids);
-
-  for (uint32_t i = 0; i < session_count; i++) {
-    XNKID id = {};
-    Uint64toXNKID(sessions.at(i)->SessionID_UInt(), &id);
-
-    session_ids_ptr[i] = id;
-  }
-
-  GetSessionByIDs(kernel_state, session_ids_ptr, session_count,
-                  search_data->search_results_ptr,
-                  search_data->results_buffer_size);
-
-  SEARCH_RESULTS* search_results_ptr =
-      kernel_state->memory()->TranslateVirtual<SEARCH_RESULTS*>(
-          search_data->search_results_ptr);
-
   xam::XUSER_CONTEXT* search_contexts_ptr =
       kernel_state->memory()->TranslateVirtual<xam::XUSER_CONTEXT*>(
           search_data->ctx_ptr);
@@ -1014,8 +1411,375 @@ X_RESULT XSession::GetSessions(KernelState* kernel_state,
       kernel_state->memory()->TranslateVirtual<xam::XUSER_PROPERTY*>(
           search_data->props_ptr);
 
+  LogSessionSearchQuery(search_data, num_users, search_contexts_ptr,
+                        search_properties_ptr);
+
+  const auto sessions =
+      kernel_state->GetXboxLiveAPI()->SessionSearch(search_data, num_users);
+
+  std::vector<uint32_t> filtered_indices;
+
+  // Free-battle vs squad-lobby login guard. Within a proc_index 0 browse the
+  // context 0x800B discriminates the two: 0 == free battle, non-zero == the
+  // searcher's nation for a squad-lobby browse. A FREE-BATTLE search legitimately
+  // leaves the hopper rendezvous property 0x20000001 at its wildcard (0), and
+  // that must still match (any free-battle session) -- so it falls through to the
+  // normal filter below. A SQUAD-LOBBY search (0x800B != 0) that also leaves
+  // 0x20000001 wildcard is under-constrained: it matches any same-mode/same-nation
+  // session, so on login the title joins an unrelated squad's lobby. Reject only
+  // that case so the title self-hosts; a genuine squad join carries a specific
+  // (non-zero) 0x20000001 and is unaffected. Scoped to the no-XLast hand-filtered
+  // path; XLast titles use their own matchmaking query.
+  bool reject_squad_wildcard = false;
+  if (static_cast<uint32_t>(search_data->proc_index) == 0) {
+    bool wildcard_hopper = false;
+    for (uint32_t p = 0; p < search_data->num_props; p++) {
+      const xam::XUSER_PROPERTY& search_prop = search_properties_ptr[p];
+      if (static_cast<uint32_t>(search_prop.property_id) == 0x20000001 &&
+          IsWildcardSearchProperty(search_prop.data)) {
+        wildcard_hopper = true;
+        break;
+      }
+    }
+    bool squad_search = false;  // 0x800B != 0 -> squad-lobby browse
+    for (uint32_t c = 0; c < search_data->num_ctx; c++) {
+      const xam::XUSER_CONTEXT& search_ctx = search_contexts_ptr[c];
+      if (static_cast<uint32_t>(search_ctx.context_id) == 0x0000800B &&
+          static_cast<uint32_t>(search_ctx.value) != 0) {
+        squad_search = true;
+        break;
+      }
+    }
+    reject_squad_wildcard = wildcard_hopper && squad_search;
+  }
+
+  // NOTE: these filters used to be gated on !HasXLast(), on the assumption that
+  // an XLAST-driven path would take over. It would not: the HasXLast() branch
+  // below reads the query's parameters/filters/returns and only LOGS them --
+  // nothing evaluates them, and the filter operator (`op`) is not parsed at all
+  // (there is no GetFiltersOp). So supplying XLAST data did not swap filtering,
+  // it REMOVED it, keeping every session the backend returned. The failure
+  // signature is *more* results, which reads as success while reintroducing the
+  // cross-squad and parallel-lobby matches these filters exist to prevent.
+  //
+  // The hand filters therefore run unconditionally and stay authoritative.
+  // Moving matchmaking to server-supplied XLAST is still the goal, but it needs
+  // the XLAST path to actually evaluate filters first; until then this is a
+  // strict improvement on upstream, which has the same latent gap.
+  if (reject_squad_wildcard) {
+    XELOGI(
+        "Session search: squad-lobby browse (0x800B!=0) with wildcard "
+        "0x20000001=0 -> returning 0 results (avoids joining an unrelated squad "
+        "lobby on login; free-battle 0x800B=0 searches are unaffected)");
+    for (uint32_t s = 0; s < sessions.size(); s++) {
+      filtered_indices.push_back(s);
+    }
+  } else if (search_data->num_ctx > 0 || search_data->num_props > 0) {
+    std::vector<uint32_t> pending_indices;
+
+    // Classify one session against the search criteria: 2 = keep, 1 = reject
+    // (identifiable but not a match), 0 = pending -- returned with no properties
+    // yet, so there is nothing to filter on but its id (a freshly-created lobby
+    // still populating). Reused by the wait-for-identity re-poll below.
+    auto classify_session =
+        [&](uint64_t session_id,
+            const std::vector<xam::Property>& all_properties) -> int {
+      if (all_properties.empty()) {
+        return 0;  // undecidable yet -> hold for re-poll rather than reject
+      }
+
+      // Active-session exclusion (property 0x1000004C, INT32): 1 == joinable,
+      // 2 == a mission is under way. The title never SEARCHES on this, so the
+      // criteria loop below cannot reject on it -- that loop only tests what the
+      // searcher asked for, and an in-progress session otherwise satisfies the
+      // browse and shows up as joinable. This is a session-STATE rejection, not
+      // a search-criteria one: any returned session storing 2 is dropped
+      // regardless of the query. It applies uniformly -- a Neroimus war session
+      // stays at 2 for the rest of its life (terminal), while a free-battle
+      // session flips back to 1 when its match ends and reappears on its own, so
+      // no per-mode gating is needed.
+      for (const auto& property : all_properties) {
+        if (!property.IsContext() &&
+            property.GetPropertyId().value == 0x1000004C &&
+            property.get_data()->data.u32 == 2) {
+          XELOGI(
+              "  filter: session {:016X} excluded -- active (0x1000004C=2)",
+              session_id);
+          return 1;  // identifiable but not joinable
+        }
+      }
+
+      // Iterate the search criteria (not the session's properties) so an
+      // unmatched criterion excludes the session while a wildcard criterion is
+      // simply satisfied. A session passes only if every searched context and
+      // property is satisfied by one of the session's stored values.
+      uint32_t ctx_matched = 0;
+      for (uint32_t c = 0; c < search_data->num_ctx; c++) {
+        const xam::XUSER_CONTEXT& search_ctx = search_contexts_ptr[c];
+        // Nation (context 0x2): only the OPPOSING-nations conquest browse
+        // (proc_index 2) wants sessions whose nation DIFFERS from the searcher's
+        // -- it matches 0x2 on inequality. The SQUAD browse (proc_index 1)
+        // carries the same 0x2 context but wants the SAME nation (equality), so
+        // the inversion must be gated on proc_index, NOT on 0x2's mere presence
+        // -- gating on presence wrongly excluded same-nation squads (0x2=1 vs a
+        // nation-1 session -> 1!=1 -> dropped). The own-nation conquest browse
+        // omits 0x2 entirely. All other contexts stay equality.
+        const bool opposing_nation =
+            search_ctx.context_id == 0x00000002 &&
+            static_cast<uint32_t>(search_data->proc_index) == 2;
+        bool ctx_found = false, ctx_ok = false;
+        uint32_t stored_ctx = 0;
+        for (const auto& property : all_properties) {
+          if (property.IsContext() &&
+              property.GetPropertyId().value == search_ctx.context_id) {
+            ctx_found = true;
+            stored_ctx = property.get_data()->data.u32;
+            const bool value_equal = stored_ctx == search_ctx.value;
+            ctx_ok = opposing_nation ? !value_equal : value_equal;
+            break;
+          }
+        }
+        if (ctx_ok) {
+          ctx_matched++;
+        }
+        if (cvars::session_search_log_criteria) {
+          XELOGI(
+              "  filter[{:016X}] ctx id=0x{:08X} op={} search=0x{:08X} "
+              "stored=0x{:08X} present={} -> {}",
+              session_id, static_cast<uint32_t>(search_ctx.context_id),
+              opposing_nation ? "!=" : "==",
+              static_cast<uint32_t>(search_ctx.value), stored_ctx,
+              ctx_found ? 1 : 0, ctx_ok ? "match" : "NO");
+        }
+      }
+
+      uint32_t props_matched = 0;
+      for (uint32_t p = 0; p < search_data->num_props; p++) {
+        const xam::XUSER_PROPERTY& search_prop = search_properties_ptr[p];
+        const uint32_t pid = static_cast<uint32_t>(search_prop.property_id);
+        bool prop_found = false, prop_ok = false;
+        uint64_t stored_raw = 0;
+        const char* op_name = SearchOpName(GetPropertySearchOp(pid));
+        // The paired-hopper dedup (a wildcard slot matches only a session that
+        // POPULATES it) is specific to the proc_index=2 conquest browse, which
+        // issues a separate wildcard search per slot and would otherwise return
+        // a one-slot session twice. Other queries (e.g. proc_index=0 free battle)
+        // reuse these ids differently -- there a wildcard(0) slot is a plain
+        // don't-care. Gating on proc_index==2 (mirrors the 0x2 nation inversion)
+        // fixes free-battle sessions that live in the OTHER slot being wrongly
+        // excluded (build/logs/session_searches action 4: target stored slot2=1,
+        // slot1=0; the slot1 wildcard demanded slot1 populated -> false negative).
+        const bool paired_hopper =
+            IsPairedHopperSlot(pid) &&
+            static_cast<uint32_t>(search_data->proc_index) == 2;
+        if (IsWildcardSearchProperty(search_prop.data)) {
+          if (paired_hopper) {
+            // Wildcard on a hopper slot: match only if the session populates
+            // this slot (non-zero), so a session living in one slot isn't
+            // returned by both slot searches (which duplicates it).
+            op_name = "wild-hopper";
+            for (const auto& property : all_properties) {
+              if (!property.IsContext() &&
+                  property.GetPropertyId().value == pid) {
+                prop_found = true;
+                stored_raw =
+                    static_cast<uint64_t>(property.get_data()->data.filetime);
+                if (!IsWildcardSearchProperty(*property.get_data())) {
+                  prop_ok = true;
+                }
+                break;
+              }
+            }
+          } else {
+            op_name = "wildcard";
+            prop_ok = true;
+          }
+        } else {
+          for (const auto& property : all_properties) {
+            if (!property.IsContext() &&
+                property.GetPropertyId().value == pid) {
+              prop_found = true;
+              stored_raw =
+                  static_cast<uint64_t>(property.get_data()->data.filetime);
+              if (CompareStoredToSearch(property, search_prop.data,
+                                        GetPropertySearchOp(pid),
+                                        kernel_state->memory())) {
+                prop_ok = true;
+              }
+              break;
+            }
+          }
+        }
+        if (prop_ok) {
+          props_matched++;
+        }
+        if (cvars::session_search_log_criteria) {
+          XELOGI(
+              "  filter[{:016X}] prop id=0x{:08X} op={} search=0x{:016X} "
+              "stored=0x{:016X} present={} -> {}",
+              session_id, pid, op_name,
+              static_cast<uint64_t>(search_prop.data.data.filetime), stored_raw,
+              prop_found ? 1 : 0, prop_ok ? "match" : "NO");
+        }
+      }
+
+      const bool excluded = props_matched < search_data->num_props ||
+                            ctx_matched < search_data->num_ctx;
+      // TEMP diagnostic: per-session filter verdict, so over-exclusion can be
+      // pinpointed without guessing which session/criterion failed. nation and
+      // the hopper-slot flags are the discriminators for the opposing browse.
+      uint32_t dbg_nation = 0;
+      bool dbg_slot1 = false, dbg_slot2 = false;
+      for (const auto& property : all_properties) {
+        if (property.IsContext()) {
+          if (property.GetPropertyId().value == 0x00000002)
+            dbg_nation = property.get_data()->data.u32;
+          continue;
+        }
+        const uint32_t pid = property.GetPropertyId().value;
+        if (pid == 0x20000001)
+          dbg_slot1 = !IsWildcardSearchProperty(*property.get_data());
+        else if (pid == 0x20000002)
+          dbg_slot2 = !IsWildcardSearchProperty(*property.get_data());
+      }
+      XELOGI(
+          "  filter: session {:016X} nation={} slot1set={} slot2set={} "
+          "ctx {}/{} props {}/{} -> {}",
+          session_id, dbg_nation, dbg_slot1, dbg_slot2, ctx_matched,
+          static_cast<uint32_t>(search_data->num_ctx), props_matched,
+          static_cast<uint32_t>(search_data->num_props),
+          excluded ? "EXCLUDED" : "kept");
+      return excluded ? 1 : 2;
+    };
+
+    // First pass: classify every returned session.
+    for (uint32_t s = 0; s < sessions.size(); s++) {
+      const auto all_properties =
+          kernel_state->GetXboxLiveAPI()->SessionPropertiesGet(
+              sessions.at(s)->SessionID_UInt());
+      switch (
+          classify_session(sessions.at(s)->SessionID_UInt(), all_properties)) {
+        case 1:
+          filtered_indices.push_back(s);
+          break;
+        case 0:
+          pending_indices.push_back(s);
+          break;
+        default:
+          break;  // 2 -> kept (left out of filtered_indices)
+      }
+    }
+
+    // Wait-for-identity: if nothing was kept but some candidates were returned
+    // without properties yet (a squad-mate's lobby that was just created and
+    // hasn't populated its context), those are the only joinable hope -- failing
+    // now forces the title to self-host a parallel lobby. Re-poll just those
+    // candidates until one populates and matches (join it), all populate as
+    // non-matches (reject), or the budget expires (reject -> self-host). A
+    // property-less session is never joined; it is only ever joined after it
+    // becomes identifiable and passes the same filter, so the squad-identity
+    // invariant holds (we never join the wrong squad's half-formed lobby).
+    const size_t kept_count =
+        sessions.size() - filtered_indices.size() - pending_indices.size();
+    if (kept_count == 0 && !pending_indices.empty() &&
+        cvars::session_search_populate_timeout_ms > 0) {
+      XELOGI(
+          "Session search: 0 kept, {} candidate(s) not yet populated; waiting "
+          "up to {}ms for identity before self-hosting",
+          pending_indices.size(),
+          cvars::session_search_populate_timeout_ms);
+      const auto deadline =
+          std::chrono::steady_clock::now() +
+          std::chrono::milliseconds(
+              int64_t(cvars::session_search_populate_timeout_ms));
+      constexpr auto kPollInterval = std::chrono::milliseconds(750);
+      bool matched = false;
+      while (!pending_indices.empty() && !matched &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(kPollInterval);
+        std::vector<uint32_t> still_pending;
+        for (uint32_t s : pending_indices) {
+          const auto props =
+              kernel_state->GetXboxLiveAPI()->SessionPropertiesGet(
+                  sessions.at(s)->SessionID_UInt());
+          switch (classify_session(sessions.at(s)->SessionID_UInt(), props)) {
+            case 2:
+              matched = true;  // now identifiable and a match -> keep
+              break;
+            case 1:
+              filtered_indices.push_back(s);  // populated, but not our match
+              break;
+            default:
+              still_pending.push_back(s);  // still empty -> keep waiting
+              break;
+          }
+        }
+        pending_indices.swap(still_pending);
+      }
+      // Anything that never populated in time (or was left pending once another
+      // candidate matched) is rejected: we only ever return identified matches.
+      for (uint32_t s : pending_indices) {
+        filtered_indices.push_back(s);
+      }
+      XELOGI(matched
+                 ? "Session search: a candidate populated and matched -> "
+                   "joining (avoided a parallel lobby)"
+                 : "Session search: no candidate matched within budget -> "
+                   "search fails, title will self-host");
+    } else {
+      // Not waiting (something kept, nothing pending, or disabled): a still-empty
+      // candidate is treated as a non-match, exactly as before.
+      for (uint32_t s : pending_indices) {
+        filtered_indices.push_back(s);
+      }
+    }
+  }
+  const uint32_t session_count = std::min<int32_t>(
+      search_data->num_results,
+      static_cast<uint32_t>(sessions.size() - filtered_indices.size()));
+
+  XELOGI("Session search: {} returned, {} kept, {} excluded by filter.",
+         session_count + filtered_indices.size(), session_count,
+         filtered_indices.size());
+  const uint32_t session_ids =
+      kernel_state->memory()->SystemHeapAlloc(session_count * sizeof(XNKID));
+
+  XNKID* session_ids_ptr =
+      kernel_state->memory()->TranslateVirtual<XNKID*>(session_ids);
+
+  // Compact the kept sessions into the session_count-sized id array. The filter
+  // check indexes the FULL session list by `i`, but the write must use a
+  // SEPARATE output index: otherwise, when an excluded session precedes a kept
+  // one, the kept id is written at an out-of-bounds original index while the
+  // in-bounds slot stays zero -- so the title later joins session id 0
+  // (XSessionGet(0000...) -> not found -> self-host into a separate lobby).
+  uint32_t out_index = 0;
+  for (uint32_t i = 0; i < sessions.size() && out_index < session_count; i++) {
+    if (std::find(filtered_indices.begin(), filtered_indices.end(), i) !=
+        filtered_indices.end()) {
+      continue;  // excluded by filter
+    }
+    XNKID id = {};
+    Uint64toXNKID(sessions.at(i)->SessionID_UInt(), &id);
+    session_ids_ptr[out_index] = id;
+    out_index++;
+  }
+  GetSessionByIDs(kernel_state, session_ids_ptr, session_count,
+                  search_data->search_results_ptr,
+                  search_data->results_buffer_size);
+
+  SEARCH_RESULTS* search_results_ptr =
+      kernel_state->memory()->TranslateVirtual<SEARCH_RESULTS*>(
+          search_data->search_results_ptr);
+
   util::XLastMatchmakingQuery* matchmaking_query = nullptr;
 
+  // DIAGNOSTIC ONLY -- this branch describes the title's declared matchmaking
+  // query; it does NOT filter. The parameters/filters/returns read below are
+  // logged and discarded, and the comparison operator is never parsed, so
+  // nothing here can reproduce the filtering above. Wiring it up means
+  // implementing evaluation (and an `op` reader) first -- until then, do not
+  // gate the real filters on this.
   if (kernel_state->emulator()->game_info_database()->HasXLast()) {
     matchmaking_query = kernel_state->emulator()
                             ->game_info_database()
@@ -1057,13 +1821,24 @@ X_RESULT XSession::GetSessions(KernelState* kernel_state,
     }
   }
 
-  for (uint32_t i = 0; i < session_count; i++) {
+  // Fill each result row's contexts/properties keyed on the session id that
+  // GetSessionByIDs actually wrote to that row -- NOT sessions.at(i), which
+  // indexes the FULL pre-filter list. GetSessionByIDs compacts the kept
+  // sessions (dropping filtered + host-less entries), so results_ptr[i] holds
+  // the i-th SURVIVOR's id. Pairing it with sessions.at(i)'s properties
+  // mismatched the two whenever an excluded session preceded a kept one: the
+  // browser then showed a kept session's id wearing an excluded session's
+  // properties (e.g. the wrong squad name, until join re-fetched by real id).
+  const uint32_t filled_count = search_results_ptr->header.search_results_count;
+  for (uint32_t i = 0; i < filled_count; i++) {
+    const uint64_t result_session_id =
+        XNKIDtoUint64(&search_results_ptr->results_ptr[i].info.sessionID);
+
     std::vector<xam::Property> contexts = {};
     std::vector<xam::Property> properties = {};
 
     const auto all_properties =
-        kernel_state->GetXboxLiveAPI()->SessionPropertiesGet(
-            sessions.at(i)->SessionID_UInt());
+        kernel_state->GetXboxLiveAPI()->SessionPropertiesGet(result_session_id);
 
     for (const auto& property : all_properties) {
       if (property.IsContext()) {

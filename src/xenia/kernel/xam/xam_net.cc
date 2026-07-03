@@ -18,6 +18,7 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/gns_transport.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/net_utils.h"
 #include "xenia/kernel/util/network_adapter_manager.h"
@@ -52,6 +53,15 @@ DECLARE_bool(log_mask_ips);
 DECLARE_int32(network_mode);
 
 DECLARE_bool(bind_interface);
+
+DEFINE_bool(
+    qos_honest, true,
+    "Netplay: answer XNetQosLookup with the real GNS peer-link state (probe the "
+    "peer, report TARGET_CONTACTED + measured RTT only if the P2P link comes up) "
+    "instead of always-reachable fabricated metrics. Peers not mapped over GNS "
+    "(native/systemlink) keep the legacy fabricated result either way. Disable to "
+    "restore the old always-COMPLETE-and-contacted behavior.",
+    "Live");
 
 enum XNET_QOS {
   LISTEN_ENABLE = 0x01,
@@ -795,6 +805,15 @@ dword_result_t NetDll_XNetServerToInAddr_entry(dword_t caller,
 
   pina->s_addr = htonl(server_addr);
 
+  // Route this title server over GNS too: derive its peer_key from the same
+  // online IP the server-side gateway uses (Phase 7).
+  if (GNSTransport::IsEnabled()) {
+    const uint64_t key = GNSTransport::ServerPeerKeyFromIna(pina->s_addr);
+    GNSTransport::Get()->MapPeer(pina->s_addr, key);
+    XELOGI("[GNS] mapped title server {} -> key xe:{:016x}",
+           ip_to_string(*pina), key);
+  }
+
   XELOGI("Server IP: {}", ip_to_string(*pina));
 
   return X_ERROR_SUCCESS;
@@ -832,6 +851,13 @@ dword_result_t NetDll_XNetTsAddrToInAddr_entry(dword_t caller,
   // Use XNKID to lookup security association?
 
   *ina_ptr = tsaddr_ptr->inaOnline;
+
+  // Route this title server over GNS too: derive its peer_key from the same
+  // online IP the server-side gateway uses (Phase 7).
+  if (GNSTransport::IsEnabled()) {
+    GNSTransport::Get()->MapPeer(ina_ptr->s_addr,
+                                 GNSTransport::ServerPeerKeyFromIna(ina_ptr->s_addr));
+  }
 
   IsValidXNKID(xnkid_ptr->as_uintBE64());
 
@@ -888,6 +914,20 @@ dword_result_t NetDll_XNetXnAddrToInAddr_entry(dword_t caller,
 
   if (kernel_state()->GetXboxLiveAPI()->IsConnectedToServer()) {
     in_addr->s_addr = xn_addr->inaOnline.s_addr;
+  }
+
+  // Map this peer into the GNS registry so guest sockets that later target its
+  // online IP (e.g. the session's peer-to-peer TCP connect) route over GNS. The
+  // peer's MAC (abEnet) is its symmetric peer_key; self/loopback already
+  // returned above. This is the forward-resolution companion to the Phase 4a
+  // mapping in XNetInAddrToXnAddr -- the connect path uses *this* function.
+  if (GNSTransport::IsEnabled() && in_addr->s_addr) {
+    const uint64_t mac = MacAddress(xn_addr->abEnet).to_uint64();
+    if (mac) {
+      GNSTransport::Get()->MapPeer(in_addr->s_addr, mac);
+      XELOGI("[GNS] mapped peer {} -> key xe:{:016x}", ip_to_string(*in_addr),
+             mac);
+    }
   }
 
   return X_ERROR_SUCCESS;
@@ -953,13 +993,12 @@ dword_result_t NetDll_XNetInAddrToXnAddr_entry(dword_t caller, dword_t in_addr,
       IsValidXNKID(player->SessionID());
 
       if (player->SessionID()) {
-        XLiveAPI::sessionIdCache[xn_addr->inaOnline.s_addr] =
-            player->SessionID();
+        XLiveAPI::SetPeerSession(xn_addr->inaOnline.s_addr, player->SessionID());
       }
 
       if (player->MacAddress()) {
-        XLiveAPI::macAddressCache[xn_addr->inaOnline.s_addr] =
-            player->MacAddress();
+        XLiveAPI::CacheRemotePeerMac(xn_addr->inaOnline.s_addr,
+                                     player->MacAddress());
       }
     } else {
       // Remote mac missing for systemlink!
@@ -967,8 +1006,8 @@ dword_result_t NetDll_XNetInAddrToXnAddr_entry(dword_t caller, dword_t in_addr,
       //
       // If we're connected to server then use it
       if (player->MacAddress()) {
-        XLiveAPI::macAddressCache[xn_addr->inaOnline.s_addr] =
-            player->MacAddress();
+        XLiveAPI::CacheRemotePeerMac(xn_addr->inaOnline.s_addr,
+                                     player->MacAddress());
       }
     }
   }
@@ -991,7 +1030,7 @@ dword_result_t NetDll_XNetInAddrToXnAddr_entry(dword_t caller, dword_t in_addr,
     if (cached_session_id) {
       session_id = cached_session_id;
     } else {
-      session_id = XLiveAPI::sessionIdCache[xn_addr->inaOnline.s_addr];
+      session_id = XLiveAPI::GetPeerSession(xn_addr->inaOnline.s_addr);
     }
 
     memcpy(sessionId_ptr, &session_id, sizeof(uint64_t));
@@ -1426,13 +1465,62 @@ dword_result_t NetDll_XNetQosLookup_entry(
 
       // 415607DD and 415607D4 expect probes count, otherwise spams lookup.
       qos_info.probes_xmit = probes_count.value();
-      qos_info.probes_recv = probes_count.value();
-      qos_info.rtt_min_in_msecs = 10;
-      qos_info.rtt_med_in_msecs = 10;
-      qos_info.up_bits_per_sec = static_cast<uint32_t>(5_MiB);
-      qos_info.down_bits_per_sec = static_cast<uint32_t>(5_MiB);
-      qos_info.flags |=
-          XNET_XNQOSINFO::COMPLETE | XNET_XNQOSINFO::TARGET_CONTACTED;
+
+      // Link metrics. For peers not carried over GNS (native/systemlink) -- and
+      // whenever honest QoS is off -- fabricate an always-reachable result: the
+      // title only needs a viable target and those links aren't measurable here.
+      // For a GNS-mapped peer with honest QoS on, report the *real* P2P link:
+      // actively probe it, wait briefly (like a real QoS probe) for the GNS
+      // session/stream to come up, and only then claim TARGET_CONTACTED with the
+      // measured RTT. If it never settles, report COMPLETE-but-uncontacted so the
+      // title honestly sees the peer as unreachable instead of being lied to.
+      auto* gns = GNSTransport::Get();
+      const uint32_t peer_ina =
+          i < remote_addresses->size()
+              ? static_cast<uint32_t>(remote_addresses->at(i).inaOnline.s_addr)
+              : 0;
+      const bool honest_gns = cvars::qos_honest && gns->IsEnabled() &&
+                              peer_ina && gns->IsMapped(peer_ina);
+
+      if (honest_gns) {
+        GNSTransport::PeerStatus ps = gns->GetPeerStatus(peer_ina);
+        // Bounded probe/wait for the link. Skip the wait for a synchronous
+        // (probes_count==0) lookup the title expects to return immediately.
+        const int max_iters = probes_count ? 16 : 1;  // ~16 x 50ms = 0.8s
+        for (int t = 0; t < max_iters && !ps.connected &&
+                        !stop_token.stop_requested();
+             ++t) {
+          gns->ProbePeer(peer_ina);
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          ps = gns->GetPeerStatus(peer_ina);
+        }
+        qos_info.flags |= XNET_XNQOSINFO::COMPLETE;
+        if (ps.connected) {
+          uint32_t ping = ps.ping_ms <= 0 ? 1u : static_cast<uint32_t>(ps.ping_ms);
+          if (ping > 0xFFFF) ping = 0xFFFF;
+          qos_info.probes_recv = probes_count.value();
+          qos_info.rtt_min_in_msecs = static_cast<uint16_t>(ping);
+          qos_info.rtt_med_in_msecs = static_cast<uint16_t>(ping);
+          qos_info.up_bits_per_sec = static_cast<uint32_t>(5_MiB);
+          qos_info.down_bits_per_sec = static_cast<uint32_t>(5_MiB);
+          qos_info.flags |= XNET_XNQOSINFO::TARGET_CONTACTED;
+          XELOGI("[GNS] QoS {:08X}: contacted, rtt {}ms", peer_ina, ping);
+        } else {
+          qos_info.probes_recv = 0;
+          qos_info.rtt_min_in_msecs = 0;
+          qos_info.rtt_med_in_msecs = 0;
+          XELOGW("[GNS] QoS {:08X}: no P2P link within probe window (uncontacted)",
+                 peer_ina);
+        }
+      } else {
+        qos_info.probes_recv = probes_count.value();
+        qos_info.rtt_min_in_msecs = 10;
+        qos_info.rtt_med_in_msecs = 10;
+        qos_info.up_bits_per_sec = static_cast<uint32_t>(5_MiB);
+        qos_info.down_bits_per_sec = static_cast<uint32_t>(5_MiB);
+        qos_info.flags |=
+            XNET_XNQOSINFO::COMPLETE | XNET_XNQOSINFO::TARGET_CONTACTED;
+      }
 
       qos->count_pending =
           std::max(static_cast<int32_t>(qos->count_pending - 1), 0);
@@ -2248,24 +2336,95 @@ struct host_set {
     }
   }
 
+  // A GNS-routed socket (TCP stream or UDP/VDP datagram) carries peer data over
+  // GameNetworkingSockets, not the native handle, so select() consults its GNS
+  // state and must NOT put its (dataless) native fd in the native set.
+  static bool IsGNSManaged(const object_ref<XSocket>& s) {
+    return s && (s->is_gns_stream() || s->is_gns_datagram());
+  }
+
   void Store(fd_set* native_set) {
     FD_ZERO(native_set);
     for (uint32_t i = 0; i < count; ++i) {
       const object_ref<XSocket>& socket = sockets[i];
-      if (socket) {
+      if (socket && !IsGNSManaged(socket) &&
+          socket->native_handle() != static_cast<uint64_t>(-1)) {
         FD_SET(socket->native_handle(), native_set);
       }
     }
   }
 
-  void UpdateFrom(fd_set* native_set) {
+  // kind: 0 = read (readable), 1 = write (writable / connect complete),
+  // 2 = except (connect failed / reset).
+  static bool SocketReady(const object_ref<XSocket>& socket, int kind,
+                          const fd_set* native_set) {
+    if (!socket) {
+      return false;
+    }
+    if (socket->is_gns_stream()) {
+      return kind == 0   ? socket->GNSStreamReadable()
+             : kind == 1 ? socket->GNSStreamWritable()
+                         : socket->GNSStreamClosed();
+    }
+    if (socket->is_gns_datagram()) {
+      // Readable when the GNS queue has a datagram; always writable (sendto
+      // never blocks); no exceptional state.
+      return kind == 0 ? socket->GNSDatagramReadable() : kind == 1;
+    }
+    if (socket->native_handle() == static_cast<uint64_t>(-1)) {
+      return false;
+    }
+    return FD_ISSET(socket->native_handle(), native_set) != 0;
+  }
+
+  bool AnyGNSManaged() const {
+    for (uint32_t i = 0; i < count; ++i) {
+      if (IsGNSManaged(sockets[i])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool AnyGNSReady(int kind) const {
+    for (uint32_t i = 0; i < count; ++i) {
+      // GNS readiness is state/queue based -- no native fd_set needed.
+      if (IsGNSManaged(sockets[i]) && SocketReady(sockets[i], kind, nullptr)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Number of sockets that actually go into the native fd_set (real native
+  // handle, not GNS-managed). select() with an all-empty fd_set fails on
+  // Windows (WSAEINVAL), so callers must avoid it.
+  uint32_t NativeCount() const {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      const object_ref<XSocket>& s = sockets[i];
+      if (s && !IsGNSManaged(s) &&
+          s->native_handle() != static_cast<uint64_t>(-1)) {
+        ++n;
+      }
+    }
+    return n;
+  }
+
+  bool AnyReady(int kind, const fd_set* native_set) const {
+    for (uint32_t i = 0; i < count; ++i) {
+      if (SocketReady(sockets[i], kind, native_set)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void UpdateFrom(fd_set* native_set, int kind) {
     uint32_t new_count = 0;
     for (uint32_t i = 0; i < count; ++i) {
-      const object_ref<XSocket>& socket = sockets[i];
-      if (socket) {
-        if (FD_ISSET(socket->native_handle(), native_set)) {
-          sockets[new_count++] = socket;
-        }
+      if (SocketReady(sockets[i], kind, native_set)) {
+        sockets[new_count++] = sockets[i];
       }
     }
     count = new_count;
@@ -2336,31 +2495,111 @@ int_result_t NetDll_select_entry(dword_t caller, dword_t nfds,
     timeout_in = &timeout;
   }
 
-  const int handles_count =
-      select(nfds, readfds ? &native_readfds : nullptr,
-             writefds ? &native_writefds : nullptr,
-             exceptfds ? &native_exceptfds : nullptr, timeout_in);
+  // GNS-routed sockets (TCP streams and peer UDP/VDP) carry their data through
+  // the transport, not the native fd, so native select() can't wait on them.
+  const bool has_gns = host_readfds.AnyGNSManaged() ||
+                       host_writefds.AnyGNSManaged() ||
+                       host_exceptfds.AnyGNSManaged();
+
+  auto deadline = std::chrono::steady_clock::time_point::max();
+  if (timeout_ptr) {
+    deadline = std::chrono::steady_clock::now() +
+               std::chrono::seconds(timeout.tv_sec) +
+               std::chrono::microseconds(timeout.tv_usec);
+  }
+
+  int handles_count = 0;
+  if (!has_gns) {
+    // Ordinary native select honoring the full guest timeout.
+    handles_count = select(nfds, readfds ? &native_readfds : nullptr,
+                           writefds ? &native_writefds : nullptr,
+                           exceptfds ? &native_exceptfds : nullptr, timeout_in);
+    if (handles_count == X_SOCKET_ERROR) {
+      XThread::SetLastError(XSocket::GetLastWSAError());
+    }
+  } else {
+    // Poll: return the instant anything is ready; otherwise block the native
+    // sockets for a slice (so their data still wakes us promptly) or sleep the
+    // slice, re-checking GNS state, until ready or the guest timeout elapses.
+    for (;;) {
+      if (readfds) host_readfds.Store(&native_readfds);
+      if (writefds) host_writefds.Store(&native_writefds);
+      if (exceptfds) host_exceptfds.Store(&native_exceptfds);
+
+      const uint32_t native_fds = (readfds ? host_readfds.NativeCount() : 0) +
+                                  (writefds ? host_writefds.NativeCount() : 0) +
+                                  (exceptfds ? host_exceptfds.NativeCount() : 0);
+
+      // GNS readiness is state/queue based -- check it without waiting so a
+      // ready stream/datagram returns with no added latency.
+      const bool gns_ready = (readfds && host_readfds.AnyGNSReady(0)) ||
+                             (writefds && host_writefds.AnyGNSReady(1)) ||
+                             (exceptfds && host_exceptfds.AnyGNSReady(2));
+
+      int64_t slice_us = 20000;
+      if (timeout_ptr) {
+        auto now = std::chrono::steady_clock::now();
+        int64_t rem_us =
+            deadline > now
+                ? std::chrono::duration_cast<std::chrono::microseconds>(
+                      deadline - now)
+                      .count()
+                : 0;
+        if (rem_us < slice_us) slice_us = rem_us;
+      }
+
+      if (native_fds > 0) {
+        // Block on native sockets so their data wakes us immediately; but poll
+        // non-blocking if a GNS socket is already ready (just snapshot native
+        // readiness for the result).
+        timeval zero = {0, 0};
+        timeval slice_tv = {static_cast<long>(slice_us / 1000000),
+                            static_cast<long>(slice_us % 1000000)};
+        timeval* to = gns_ready ? &zero : &slice_tv;
+        handles_count = select(nfds, readfds ? &native_readfds : nullptr,
+                               writefds ? &native_writefds : nullptr,
+                               exceptfds ? &native_exceptfds : nullptr, to);
+        if (handles_count == X_SOCKET_ERROR) {
+          XThread::SetLastError(XSocket::GetLastWSAError());
+          break;
+        }
+      } else if (!gns_ready && slice_us > 0) {
+        // GNS-only set with nothing ready: wait a slice before re-polling.
+        std::this_thread::sleep_for(std::chrono::microseconds(slice_us));
+      }
+
+      const bool any =
+          (readfds && host_readfds.AnyReady(0, &native_readfds)) ||
+          (writefds && host_writefds.AnyReady(1, &native_writefds)) ||
+          (exceptfds && host_exceptfds.AnyReady(2, &native_exceptfds));
+      if (any || std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
+    }
+  }
 
   if (handles_count == X_SOCKET_ERROR) {
-    XThread::SetLastError(XSocket::GetLastWSAError());
+    return -1;
   }
 
+  int ready_total = 0;
   if (readfds) {
-    host_readfds.UpdateFrom(&native_readfds);
+    host_readfds.UpdateFrom(&native_readfds, 0);
     host_readfds.Store(readfds);
+    ready_total += host_readfds.count;
   }
   if (writefds) {
-    host_writefds.UpdateFrom(&native_writefds);
+    host_writefds.UpdateFrom(&native_writefds, 1);
     host_writefds.Store(writefds);
+    ready_total += host_writefds.count;
   }
   if (exceptfds) {
-    host_exceptfds.UpdateFrom(&native_exceptfds);
+    host_exceptfds.UpdateFrom(&native_exceptfds, 2);
     host_exceptfds.Store(exceptfds);
+    ready_total += host_exceptfds.count;
   }
 
-  // TODO(gibbed): modify ret to be what's actually copied to the guest
-  // fd_sets?
-  return handles_count;
+  return ready_total;
 }
 DECLARE_XAM_EXPORT1(NetDll_select, kNetworking, kImplemented);
 

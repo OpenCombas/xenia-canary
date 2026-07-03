@@ -212,8 +212,16 @@ bool LeaderboardObjectJSON::Serialize(
     const std::string xuid_str = fmt::format("{:016X}", xuid);
 
     if (view_index >= 1) {
-      // Sending multiple players stats is unsupported
-      XELOGI("Flushing multiple players stats is currently unsupported!");
+      // The payload format holds one player, so callers must submit one player
+      // per request -- SessionFlushStats does. Reaching here means a caller
+      // passed a multi-player map and the extra players are being DROPPED, with
+      // which player survives decided by unordered_map hash order. Warn rather
+      // than XELOGI: this silently loses stats, and it previously did so on
+      // every session with more than one player.
+      XELOGW(
+          "Leaderboard payload holds one player but {} were supplied; dropping "
+          "the rest. Post one request per player instead.",
+          stats_.size());
       assert_always();
       continue;
     }

@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <queue>
+#include <thread>
 
 #include "xenia/base/mutex.h"
 #include "xenia/base/threading.h"
@@ -70,6 +71,11 @@ class AudioSystem {
 
   void WorkerThreadMain();
 
+  // Voice side-channel Phase A: local loopback (mic -> codec encode -> decode ->
+  // host output) to validate the codec + audio path independent of netplay.
+  // Runs while cvars::voice_loopback is set (started in Setup).
+  void VoiceLoopbackThread();
+
   virtual X_STATUS CreateDriver(size_t index,
                                 xe::threading::Semaphore* semaphore,
                                 AudioDriver** out_driver) = 0;
@@ -78,6 +84,9 @@ class AudioSystem {
   Memory* memory_ = nullptr;
   cpu::Processor* processor_ = nullptr;
   std::unique_ptr<XmaDecoder> xma_decoder_;
+  // Voice side-channel local-loopback diagnostic (cvar voice_loopback).
+  std::thread voice_loopback_thread_;
+  std::atomic<bool> voice_loopback_running_{false};
   uint32_t queued_frames_;
 
   std::atomic<bool> worker_running_ = {false};

@@ -12,6 +12,7 @@
 
 #include <cstring>
 #include <future>
+#include <map>
 #include <queue>
 
 #include "xenia/base/byte_order.h"
@@ -52,6 +53,9 @@ enum class X_WSAError : uint32_t {
   X_WSANOTINITIALISED = 0x276D,
   X_WSAEADDRINUSE = 0x2740,
   X_WSAEINPROGRESS = 0x2734,
+  X_WSAENOTCONN = 0x2749,
+  X_WSAETIMEDOUT = 0x274C,
+  X_WSAECONNREFUSED = 0x274D,
 };
 
 /*
@@ -196,6 +200,28 @@ class XSocket : public XObject {
   bool QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf,
                    size_t len);
 
+  // GNSTransport receive-handler entry point: routes a datagram received over
+  // GameNetworkingSockets to the socket bound to dst_port (host byte order).
+  // Ports are host-order port numbers; src_ina is the raw guest in_addr value.
+  static void DeliverGNSPacket(uint32_t src_ina, uint16_t src_port,
+                               uint16_t dst_port, const uint8_t* data,
+                               size_t len);
+
+  // select() support for TCP-over-GNS sockets (Phase 6). A GNS stream socket
+  // has no usable native handle, so select() must consult these instead of the
+  // native fd: writable == connect complete, readable == data buffered or EOF,
+  // closed == connect failed / peer reset (reported in exceptfds).
+  bool is_gns_stream() const { return gns_stream_ != 0; }
+  bool GNSStreamWritable() const;
+  bool GNSStreamReadable() const;
+  bool GNSStreamClosed() const;
+
+  // A GNS-routed datagram (UDP/VDP) socket receives peer data into the GNS
+  // queue, not the native handle, so select() must consult the queue for
+  // readability and skip the (dataless) native fd. Writable always (sendto).
+  bool is_gns_datagram() const { return use_gns_ && gns_stream_ == 0; }
+  bool GNSDatagramReadable() const;
+
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
   uint64_t native_handle_ = -1;
@@ -217,8 +243,33 @@ class XSocket : public XObject {
   bool broadcast_socket_ = false;
 
   std::unique_ptr<xe::threading::Event> event_;
-  std::mutex incoming_packet_mutex_;
+  mutable std::mutex incoming_packet_mutex_;
+  std::condition_variable incoming_packet_cv_;
   std::queue<uint8_t*> incoming_packets_;
+
+  // When true this socket routes datagrams over GameNetworkingSockets (mapped
+  // peers) with native fallback. Decided at Bind. See docs/gns_integration.md.
+  bool use_gns_ = false;
+
+  // TCP-over-GNS state (Phase 6). gns_stream_ is the connection handle for a
+  // GNS-backed stream socket (0 = none); gns_listen_ marks a GNS TCP listen
+  // socket. nonblocking_ tracks FIONBIO so GNS connect/recv/accept know whether
+  // to block.
+  uint32_t gns_stream_ = 0;
+  bool gns_listen_ = false;
+  bool nonblocking_ = false;
+
+  // Peer endpoint of a GNS stream (the address we connected to, or the accepted
+  // peer). A GNS stream socket has no native handle, so getpeername/getsockname
+  // and getsockopt(SO_ERROR) are answered from these instead of the OS.
+  uint32_t gns_peer_ina_ = 0;
+  uint16_t gns_peer_port_ = 0;
+
+  // Global registry mapping a bound port (host byte order) to the GNS-enabled
+  // socket listening on it, so the transport's receive handler can deliver
+  // inbound datagrams to the right socket.
+  static std::mutex gns_sockets_mutex_;
+  static std::map<uint16_t, XSocket*> gns_sockets_;
 
   std::future<int> polling_task_;
 
@@ -230,6 +281,18 @@ class XSocket : public XObject {
   uint16_t GetImplicitlyBoundPort() const;
 
   int PollWSARecvFrom(bool wait, struct WSARecvFromData data);
+
+  // GNS variants of the receive paths: drain the GNS-fed incoming_packets_
+  // queue instead of the native handle. Enabled when use_gns_ is set.
+  void MaybeEnableGNS();
+  int RecvFromGNS(uint8_t* buf, uint32_t buf_len, XSOCKADDR_IN* from);
+  int PollWSARecvFromGNS(bool wait, struct WSARecvFromData data);
+
+  // TCP-over-GNS helpers (Phase 6). Connect/Accept establish a stream over the
+  // connection-oriented GNS API; Send/Recv move bytes through the reassembly
+  // buffer. See docs/gns_integration.md.
+  X_STATUS ConnectGNSStream(uint32_t dst_ina, uint16_t dst_vport);
+  object_ref<XSocket> AcceptGNSStream(XSOCKADDR_IN* name, int* name_len);
 
   void SetLastWSAError(X_WSAError) const;
 };

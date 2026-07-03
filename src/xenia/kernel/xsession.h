@@ -302,6 +302,13 @@ class XSession : public XObject {
                                   uint32_t search_results_ptr,
                                   uint32_t results_buffer_size);
 
+  // Diagnostics (session_diag cvar): enumerate all live XSession objects and log
+  // each (id / flags / host / members). WARN when >1 peer-network session is
+  // live, or any player is a member of >1 live session -- i.e. the client (or a
+  // peer) "ended up in multiple sessions" (e.g. a search that failed to match the
+  // real lobby and self-hosted a parallel one). `event` labels the trigger.
+  static void LogSessionCensus(KernelState* kernel_state, const char* event);
+
   bool IsOfflineSession() const {
     return kernel::IsOfflineSession(
         static_cast<SessionFlags>(local_details_.Flags.get()));

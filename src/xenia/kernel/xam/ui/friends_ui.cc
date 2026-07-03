@@ -19,9 +19,8 @@ FriendsUI::FriendsUI(xe::ui::ImGuiDrawer* imgui_drawer, UserProfile* profile)
     : XamDialog(imgui_drawer), profile_(profile) {
   friends_presence_ = kernel_state()->GetXboxLiveAPI()->GetFriendsPresenceAsync(
       profile->xuid());
-  immediate_gamerpics_ =
-      kernel_state()->GetXboxLiveAPI()->GetFriendsGamerpicsAsync(
-          profile->xuid(), imgui_drawer);
+  // Gamerpics for the server-authoritative friends are fetched lazily in OnDraw
+  // (the list is server-driven and can change), not from the config friends.
 }
 
 // TODO(Adrian): Move into a separate function so draw can be reused with dialog
@@ -33,9 +32,9 @@ void FriendsUI::OnDraw(ImGuiIO& io) {
 
     ImGui::OpenPopup("Friends");
 
-    if (kernel_state()->GetXboxLiveAPI()->IsConnectedToServer()) {
-      args.filter_offline = true;
-    }
+    // Show all friends by default (server presence can lag / the online flag is
+    // still being nailed down; don't hide people out from under the user).
+    args.filter_offline = false;
   }
 
   if (friends_presence_.valid()) {
@@ -48,18 +47,11 @@ void FriendsUI::OnDraw(ImGuiIO& io) {
     friends_presence_ =
         kernel_state()->GetXboxLiveAPI()->GetFriendsPresenceAsync(
             profile_->xuid());
-    immediate_gamerpics_ =
-        kernel_state()->GetXboxLiveAPI()->GetFriendsGamerpicsAsync(
-            profile_->xuid(), imgui_drawer());
     args.refresh_presence = false;
   }
 
-  if (immediate_gamerpics_.valid()) {
-    if (immediate_gamerpics_.wait_for(0s) == std::future_status::ready) {
-      immediate_gamerpics_result_.merge(immediate_gamerpics_.get());
-    }
-  }
-
+  // Server-friend gamerpics are fetched inside xeDrawFriendsContent now (shared
+  // by all hosts), so nothing to do here.
   xeDrawFriendsContent(imgui_drawer(), profile_, args,
                        &friends_presence_result_, immediate_gamerpics_result_);
 

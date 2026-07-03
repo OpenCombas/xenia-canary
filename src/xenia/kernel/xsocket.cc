@@ -9,10 +9,17 @@
 
 #include "src/xenia/kernel/xsocket.h"
 
+#include <chrono>
+#include <thread>
 #include <cstring>
 
+#include <set>
+
 #include "xenia/base/platform.h"
+#include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/gns_transport.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/util/net_utils.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 
@@ -44,6 +51,9 @@ const std::map<uint32_t, uint32_t> supported_levels = {{0xFFFF, SOL_SOCKET},
 // Translate ioctl commands to native
 const std::map<uint32_t, uint32_t> supported_controls = {
     {0x8004667E, FIONBIO}, {0x4004667F, FIONREAD}};
+
+std::mutex XSocket::gns_sockets_mutex_;
+std::map<uint16_t, XSocket*> XSocket::gns_sockets_;
 
 XSocket::XSocket(KernelState* kernel_state)
     : XObject(kernel_state, kObjectType) {}
@@ -103,6 +113,35 @@ X_STATUS XSocket::Close() {
   }
   lock.unlock();
 
+  if (use_gns_) {
+    // Stop receiving inbound GNS datagrams and wake any pending GNS poll so it
+    // observes the abort instead of waiting out its timeout.
+    {
+      std::lock_guard<std::mutex> sockets_lock(gns_sockets_mutex_);
+      auto it = gns_sockets_.find(static_cast<uint16_t>(bound_port_));
+      if (it != gns_sockets_.end() && it->second == this) {
+        gns_sockets_.erase(it);
+      }
+    }
+    incoming_packet_cv_.notify_all();
+  }
+
+  // Tear down TCP-over-GNS state (Phase 6).
+  if (gns_stream_) {
+    GNSTransport::Get()->StreamClose(gns_stream_, /*linger=*/true);
+    gns_stream_ = 0;
+  }
+  if (gns_listen_) {
+    GNSTransport::Get()->StreamStopListen(static_cast<uint16_t>(bound_port_));
+    gns_listen_ = false;
+  }
+
+  // A GNS-only accepted socket has no native handle to close.
+  if (native_handle_ == static_cast<uint64_t>(-1)) {
+    socket_closed_ = true;
+    return X_STATUS_SUCCESS;
+  }
+
   std::unique_lock socket_lock(receive_socket_mutex_);
 #if XE_PLATFORM_WIN32
   int ret = closesocket(native_handle_);
@@ -122,6 +161,21 @@ X_STATUS XSocket::Close() {
 
 X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
                             uint32_t* optlen) {
+  // A GNS stream socket has no native handle to query. Answer SO_ERROR (the
+  // post-connect success/failure check) from the GNS connection state: 0 while
+  // connecting/connected, a refusal once closed.
+  if (gns_stream_ && level == 0xFFFF && optname == 0x1007 /* SO_ERROR */) {
+    const uint32_t err =
+        GNSStreamClosed() ? uint32_t(X_WSAError::X_WSAECONNREFUSED) : 0u;
+    if (optval_ptr) {
+      xe::store_and_swap<uint32_t>(optval_ptr, err);
+    }
+    if (optlen) {
+      *optlen = 4;
+    }
+    return X_STATUS_SUCCESS;
+  }
+
   int ret =
       getsockopt(native_handle_, level, optname, static_cast<char*>(optval_ptr),
                  reinterpret_cast<socklen_t*>(optlen));
@@ -212,6 +266,15 @@ int XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
 }
 
 X_STATUS XSocket::IOControl(uint32_t cmd, uint32_t* arg_ptr) {
+  // Track FIONBIO so GNS-backed sockets know whether to block on
+  // connect/recv/accept (they have no OS handle to consult).
+  if (cmd == 0x8004667E) {  // guest FIONBIO
+    nonblocking_ = xe::load_and_swap<uint32_t>(arg_ptr) != 0;
+  }
+  // A GNS-only accepted socket has no native handle; the flag above suffices.
+  if (native_handle_ == static_cast<uint64_t>(-1)) {
+    return X_STATUS_SUCCESS;
+  }
 #ifdef XE_PLATFORM_WIN32
   const u_long initial_param = xe::load_and_swap<uint32_t>(arg_ptr);
   u_long param = initial_param;
@@ -248,6 +311,15 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint32_t* arg_ptr) {
 }
 
 X_STATUS XSocket::Connect(const XSOCKADDR_IN* name, int name_len) {
+  // Peer-to-peer TCP over GNS when the destination resolves to a mapped peer
+  // (Phase 6). Connections to real servers (unmapped) stay native.
+  if (proto_ == X_IPPROTO_TCP && GNSTransport::IsEnabled() &&
+      GNSTransport::Get()->initialized() &&
+      GNSTransport::Get()->IsMapped(name->address_ip.s_addr)) {
+    return ConnectGNSStream(name->address_ip.s_addr,
+                            static_cast<uint16_t>(name->address_port));
+  }
+
   XSOCKADDR_IN sa_in = *name;
 
   const auto upnp = kernel_state()->emulator()->GetUPnP();
@@ -316,6 +388,8 @@ X_STATUS XSocket::Bind(const XSOCKADDR_IN* name, int name_len) {
 
   bound_ = true;
 
+  MaybeEnableGNS();
+
   return X_STATUS_SUCCESS;
 }
 
@@ -333,6 +407,18 @@ uint16_t XSocket::GetImplicitlyBoundPort() const {
 }
 
 X_STATUS XSocket::Listen(int backlog) {
+  // Peer-to-peer TCP hosting over GNS (Phase 6): if GNS is up, listen on the
+  // bound port as a virtual port. v1 is GNS-only for TCP hosts; a native LAN
+  // TCP server while GNS is enabled is an accepted limitation.
+  if (proto_ == X_IPPROTO_TCP && GNSTransport::IsEnabled() &&
+      GNSTransport::Get()->initialized() && bound_port_) {
+    if (GNSTransport::Get()->StreamListen(static_cast<uint16_t>(bound_port_))) {
+      gns_listen_ = true;
+      XELOGI("[GNS] TCP listen on port {}", static_cast<uint16_t>(bound_port_));
+      return X_STATUS_SUCCESS;
+    }
+  }
+
   int ret = listen(native_handle_, backlog);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
@@ -342,6 +428,10 @@ X_STATUS XSocket::Listen(int backlog) {
 }
 
 object_ref<XSocket> XSocket::Accept(XSOCKADDR_IN* name, int* name_len) {
+  if (gns_listen_) {
+    return AcceptGNSStream(name, name_len);
+  }
+
   sockaddr sa = {};
   socklen_t addrlen = 0;
   const bool is_name_and_name_len_available = name && name_len;
@@ -379,14 +469,34 @@ object_ref<XSocket> XSocket::Accept(XSOCKADDR_IN* name, int* name_len) {
   return socket;
 }
 
-int XSocket::Shutdown(int how) { return shutdown(native_handle_, how); }
+int XSocket::Shutdown(int how) {
+  // GNS has no half-close (LingerClose is bidirectional); treat shutdown as a
+  // no-op for a GNS stream and let Close() tear it down. v1 limitation.
+  if (gns_stream_) {
+    return 0;
+  }
+  return shutdown(native_handle_, how);
+}
 
 int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
-  return recv(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags);
+  if (gns_stream_) {
+    int ret = GNSTransport::Get()->StreamRecv(gns_stream_, buf, buf_len,
+                                              !nonblocking_);
+    if (ret < 0) {
+      SetLastWSAError(X_WSAError::X_WSAEWOULDBLOCK);
+    }
+    return ret;  // >0 bytes, 0 = peer closed (EOF), -1 = would block
+  }
+  int ret = recv(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags);
+  return ret;
 }
 
 int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                       XSOCKADDR_IN* from, socklen_t* from_len) {
+  if (use_gns_) {
+    return RecvFromGNS(buf, buf_len, from);
+  }
+
   sockaddr sa = {};
 
   if (from) {
@@ -421,6 +531,10 @@ struct WSARecvFromData {
 };
 
 int XSocket::PollWSARecvFrom(bool wait, WSARecvFromData receive_async_data) {
+  if (use_gns_) {
+    return PollWSARecvFromGNS(wait, receive_async_data);
+  }
+
   receive_async_data.overlapped->internal_high = 0;
 
   struct pollfd fds[1];
@@ -658,12 +772,41 @@ bool XSocket::WSAGetOverlappedResult(XWSAOVERLAPPED* overlapped_ptr,
 }
 
 int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+  if (gns_stream_) {
+    int ret = GNSTransport::Get()->StreamSend(gns_stream_, buf, buf_len);
+    if (ret < 0) {
+      SetLastWSAError(X_WSAError::X_WSAENOTCONN);
+    }
+    return ret;
+  }
   return send(native_handle_, reinterpret_cast<const char*>(buf), buf_len,
               flags);
 }
 
 int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                     XSOCKADDR_IN* to, uint32_t to_len) {
+  // A title may talk to a server without ever binding; enable GNS lazily so the
+  // first send can still route over the transport.
+  MaybeEnableGNS();
+
+  // Route to a mapped GNS peer when possible; otherwise fall through to a
+  // native send (broadcast / LAN / unmapped real hosts).
+  if (use_gns_ && to && bound_port_) {
+    uint32_t dst_ina = to->address_ip.s_addr;
+    auto* gns = GNSTransport::Get();
+    const bool mapped = gns->IsMapped(dst_ina);
+    XELOGD("[GNS] SendTo dst_ina={:08X} dst_port={} mapped={}", dst_ina,
+           static_cast<uint16_t>(to->address_port), mapped ? 1 : 0);
+    if (mapped) {
+      const bool reliable = proto_ == X_IPPROTO_TCP;  // UDP/VDP -> unreliable
+      if (gns->SendTo(dst_ina, static_cast<uint16_t>(bound_port_),
+                      static_cast<uint16_t>(to->address_port), buf, buf_len,
+                      reliable)) {
+        return static_cast<int>(buf_len);
+      }
+    }
+  }
+
   const auto upnp = kernel_state()->emulator()->GetUPnP();
 
   if (upnp) {
@@ -711,14 +854,324 @@ bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port,
   pkt->data_len = (uint16_t)len;
   std::memcpy(pkt->data, buf, len);
 
-  std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
+  std::unique_lock<std::mutex> lock(incoming_packet_mutex_);
   incoming_packets_.push((uint8_t*)pkt);
+  lock.unlock();
+
+  // Wake any GNS receive poll waiting on this socket.
+  incoming_packet_cv_.notify_all();
 
   // TODO: Limit on number of incoming packets?
   return true;
 }
 
+X_STATUS XSocket::ConnectGNSStream(uint32_t dst_ina, uint16_t dst_vport) {
+  auto* gns = GNSTransport::Get();
+  uint32_t conn = gns->StreamConnect(dst_ina, dst_vport);
+  if (!conn) {
+    SetLastWSAError(X_WSAError::X_WSAECONNREFUSED);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  gns_stream_ = conn;
+  gns_peer_ina_ = dst_ina;
+  gns_peer_port_ = dst_vport;
+  use_gns_ = true;
+  bound_ = true;
+  XELOGI("[GNS] TCP connecting (conn {}, vport {})", conn, dst_vport);
+
+  // Non-blocking connect: report "in progress" immediately; the title selects
+  // the socket for writability, which our GNS-aware select() reports once the
+  // P2P connection establishes (the pump thread drives the handshake).
+  if (nonblocking_) {
+    SetLastWSAError(X_WSAError::X_WSAEWOULDBLOCK);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  // Blocking connect: wait for the connection to establish (or fail). Bounded so
+  // a dead peer can't hang the guest thread indefinitely.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  for (;;) {
+    switch (gns->StreamGetState(conn)) {
+      case GNSTransport::StreamState::kConnected:
+        XELOGI("[GNS] TCP connected (conn {})", conn);
+        return X_STATUS_SUCCESS;
+      case GNSTransport::StreamState::kClosed:
+        SetLastWSAError(X_WSAError::X_WSAECONNREFUSED);
+        gns->StreamClose(conn, false);
+        gns_stream_ = 0;
+        return X_STATUS_UNSUCCESSFUL;
+      default:
+        break;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      SetLastWSAError(X_WSAError::X_WSAETIMEDOUT);
+      gns->StreamClose(conn, false);
+      gns_stream_ = 0;
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+}
+
+bool XSocket::GNSStreamWritable() const {
+  return gns_stream_ && GNSTransport::Get()->StreamGetState(gns_stream_) ==
+                            GNSTransport::StreamState::kConnected;
+}
+
+bool XSocket::GNSStreamReadable() const {
+  return gns_stream_ && GNSTransport::Get()->StreamReadable(gns_stream_);
+}
+
+bool XSocket::GNSStreamClosed() const {
+  return gns_stream_ && GNSTransport::Get()->StreamGetState(gns_stream_) ==
+                            GNSTransport::StreamState::kClosed;
+}
+
+bool XSocket::GNSDatagramReadable() const {
+  std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
+  return !incoming_packets_.empty();
+}
+
+object_ref<XSocket> XSocket::AcceptGNSStream(XSOCKADDR_IN* name, int* name_len) {
+  uint32_t peer_ina = 0;
+  uint32_t conn = GNSTransport::Get()->StreamAccept(
+      static_cast<uint16_t>(bound_port_), !nonblocking_, &peer_ina);
+  if (!conn) {
+    SetLastWSAError(X_WSAError::X_WSAEWOULDBLOCK);
+    return nullptr;
+  }
+
+  // Mirror the just-learned peer into macAddressCache so XNetInAddrToXnAddr on
+  // this synthetic online IP still yields the peer's MAC (abEnet). StreamAccept
+  // registered peer_ina<->peer_key in the GNS registry (deterministic on the
+  // MAC); recover the key and cache it host-side too. This closes the host's
+  // resolution gap without any matchmaking round-trip.
+  if (peer_ina) {
+    const uint64_t peer_key = GNSTransport::Get()->PeerKeyFromIna(peer_ina);
+    if (peer_key) {
+      XLiveAPI::CacheRemotePeerMac(peer_ina, peer_key);
+    }
+  }
+
+  // A GNS-only child socket (no native handle); Send/Recv route through the
+  // stream, Close skips the native path.
+  auto socket = object_ref<XSocket>(
+      new XSocket(kernel_state_, static_cast<uint64_t>(-1)));
+  socket->af_ = af_;
+  socket->type_ = type_;
+  socket->proto_ = proto_;
+  socket->vdp_ = vdp_;
+  socket->use_gns_ = true;
+  socket->gns_stream_ = conn;
+  socket->gns_peer_ina_ = peer_ina;
+  socket->bound_port_ = bound_port_;
+  socket->bound_ = true;
+  // Inherit the listen socket's blocking mode, as Winsock accept() does. The
+  // title makes the listen socket non-blocking and never FIONBIOs the accepted
+  // one, relying on that inheritance. Native accept() gets it from the OS; a
+  // GNS-only socket has no OS handle, so without this the accepted stream stays
+  // blocking and StreamRecv (wait = !nonblocking_) blocks the receive pump on
+  // an idle peer -- hanging the whole link and stalling the lobby handshake.
+  socket->nonblocking_ = nonblocking_;
+
+  if (name && name_len) {
+    name->address_family = AddressFamily::X_AF_INET;
+    name->address_ip.s_addr = peer_ina;
+    name->address_port = 0;  // remote source virtual port not tracked in v1
+  }
+  XELOGI("[GNS] TCP accepted (conn {}, peer_ina {:08X})", conn, peer_ina);
+  return socket;
+}
+
+void XSocket::MaybeEnableGNS() {
+  if (use_gns_) {
+    return;
+  }
+  // Only connectionless (UDP/VDP) sockets are routed in this phase, and only
+  // when the transport is enabled and up. Otherwise we stay fully native.
+  if (!GNSTransport::IsEnabled() || type_ != X_SOCK_DGRAM) {
+    return;
+  }
+  auto* gns = GNSTransport::Get();
+  if (!gns->initialized()) {
+    return;
+  }
+
+  // A client socket that only ever sends (talks to a server without an explicit
+  // Bind) still needs a stable source port so the peer's replies can be routed
+  // back to it. Force an implicit bind to an ephemeral port if the title never
+  // bound us -- mirroring what a native sendto() would do anyway.
+  if (!bound_port_) {
+    sockaddr_in sa = {};
+    sa.sin_family = AF_INET;
+    sa.sin_port = 0;
+    sa.sin_addr.s_addr = INADDR_ANY;
+    bind(native_handle_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+    bound_port_ = GetImplicitlyBoundPort();
+  }
+  if (!bound_port_) {
+    return;  // no source port -> can't route return traffic; stay native
+  }
+
+  use_gns_ = true;
+
+  // Install the global receive handler exactly once.
+  static std::once_flag handler_once;
+  std::call_once(handler_once, [] {
+    GNSTransport::Get()->SetReceiveHandler(&XSocket::DeliverGNSPacket);
+  });
+
+  // Register for inbound delivery keyed by our bound port (host byte order).
+  const uint16_t port = static_cast<uint16_t>(bound_port_);
+  {
+    std::lock_guard<std::mutex> lock(gns_sockets_mutex_);
+    gns_sockets_[port] = this;
+  }
+
+  XELOGI("[GNS] socket enabled (port {}, proto {})", port,
+         static_cast<uint32_t>(proto_));
+}
+
+void XSocket::DeliverGNSPacket(uint32_t src_ina, uint16_t src_port,
+                               uint16_t dst_port, const uint8_t* data,
+                               size_t len) {
+  // Holding the registry lock across QueuePacket keeps the target socket alive
+  // (Close() unregisters under the same lock before it can be destroyed).
+  std::lock_guard<std::mutex> lock(gns_sockets_mutex_);
+  auto it = gns_sockets_.find(dst_port);
+  if (it != gns_sockets_.end()) {
+    it->second->QueuePacket(src_ina, src_port, data, len);
+  } else {
+    // A datagram arrived for a guest port with no GNS-enabled socket bound; it
+    // is dropped here. Throttled so a misconfigured flow can't flood the log.
+    static std::atomic<uint32_t> miss{0};
+    uint32_t n = miss.fetch_add(1, std::memory_order_relaxed);
+    if (n < 32 || (n & 0xFF) == 0) {
+      XELOGW("[GNS] dgram for port {} dropped: no GNS socket bound", dst_port);
+    }
+  }
+}
+
+int XSocket::RecvFromGNS(uint8_t* buf, uint32_t buf_len, XSOCKADDR_IN* from) {
+  std::unique_lock<std::mutex> lock(incoming_packet_mutex_);
+  if (incoming_packets_.empty()) {
+    lock.unlock();
+    SetLastWSAError(X_WSAError::X_WSAEWOULDBLOCK);
+    return -1;
+  }
+  uint8_t* raw = incoming_packets_.front();
+  incoming_packets_.pop();
+  lock.unlock();
+
+  packet* pkt = reinterpret_cast<packet*>(raw);
+  uint32_t n = buf_len < pkt->data_len ? buf_len : pkt->data_len;
+  std::memcpy(buf, pkt->data, n);
+
+  if (from) {
+    from->address_family = AddressFamily::X_AF_INET;
+    from->address_port = pkt->src_port;
+    from->address_ip.s_addr = pkt->src_ip;
+  }
+
+  delete[] raw;
+  return static_cast<int>(n);
+}
+
+int XSocket::PollWSARecvFromGNS(bool wait, WSARecvFromData receive_async_data) {
+  receive_async_data.overlapped->internal_high = 0;
+
+  uint8_t* raw = nullptr;
+  int ret = 0;
+
+  for (;;) {
+    if (receive_async_data.overlapped->offset_high & 2) {
+      receive_async_data.overlapped->internal_high =
+          (uint32_t)X_WSAError::X_WSA_OPERATION_ABORTED;
+      ret = -1;
+      goto threadexit;
+    }
+
+    {
+      std::unique_lock<std::mutex> lock(incoming_packet_mutex_);
+      if (!incoming_packets_.empty()) {
+        raw = incoming_packets_.front();
+        incoming_packets_.pop();
+      } else if (wait) {
+        incoming_packet_cv_.wait_for(lock, std::chrono::milliseconds(1000));
+        continue;
+      }
+    }
+
+    if (raw) {
+      break;
+    }
+    if (!wait) {
+      receive_async_data.overlapped->internal_high =
+          (uint32_t)X_WSAError::X_WSAEWOULDBLOCK;
+      ret = -1;
+      goto threadexit;
+    }
+  }
+
+  {
+    packet* pkt = reinterpret_cast<packet*>(raw);
+    uint32_t remaining = pkt->data_len;
+    const uint8_t* src = pkt->data;
+    for (uint32_t i = 0; i < receive_async_data.num_buffers && remaining; i++) {
+      uint32_t cap = receive_async_data.buffers[i].len;
+      uint32_t n = cap < remaining ? cap : remaining;
+      uint8_t* dst = reinterpret_cast<uint8_t*>(
+          kernel_state()->memory()->TranslateVirtual(
+              receive_async_data.buffers[i].buf_ptr));
+      std::memcpy(dst, src, n);
+      src += n;
+      remaining -= n;
+    }
+
+    receive_async_data.overlapped->internal = pkt->data_len - remaining;
+    if (receive_async_data.from) {
+      receive_async_data.from->address_family = AddressFamily::X_AF_INET;
+      receive_async_data.from->address_port = pkt->src_port;
+      receive_async_data.from->address_ip.s_addr = pkt->src_ip;
+    }
+    receive_async_data.overlapped->offset = 0;  // flags
+    delete[] raw;
+    SetLastWSAError((X_WSAError)0);
+    ret = 0;
+  }
+
+threadexit:
+  std::unique_lock lock(receive_mutex_);
+  if (wait) {
+    delete[] receive_async_data.buffers;
+  }
+
+  receive_async_data.overlapped->offset_high |= 1;
+
+  if (wait && receive_async_data.overlapped->event_handle) {
+    xboxkrnl::xeNtSetEvent(receive_async_data.overlapped->event_handle, nullptr);
+  }
+
+  receive_cv_.notify_all();
+  lock.unlock();
+
+  return ret;
+}
+
 X_STATUS XSocket::GetPeerName(XSOCKADDR_IN* name, int* name_len) {
+  // A GNS stream has no connected native socket, so answer from the tracked
+  // peer endpoint (getpeername on the native handle would fail).
+  if (gns_stream_) {
+    name->address_family = AddressFamily::X_AF_INET;
+    name->address_ip.s_addr = gns_peer_ina_;
+    name->address_port = gns_peer_port_;
+    if (name_len) {
+      *name_len = sizeof(sockaddr);
+    }
+    return X_STATUS_SUCCESS;
+  }
+
   sockaddr addr = name->to_host();
 
   int ret = getpeername(native_handle_, &addr, name_len);
@@ -731,6 +1184,17 @@ X_STATUS XSocket::GetPeerName(XSOCKADDR_IN* name, int* name_len) {
 }
 
 X_STATUS XSocket::GetSockName(XSOCKADDR_IN* name, int* name_len) {
+  // The accepted GNS child socket has no native handle; report our bound port.
+  if (gns_stream_ && native_handle_ == static_cast<uint64_t>(-1)) {
+    name->address_family = AddressFamily::X_AF_INET;
+    name->address_ip.s_addr = 0;
+    name->address_port = bound_port_;
+    if (name_len) {
+      *name_len = sizeof(sockaddr);
+    }
+    return X_STATUS_SUCCESS;
+  }
+
   sockaddr addr = name->to_host();
 
   int ret = getsockname(native_handle_, &addr, name_len);

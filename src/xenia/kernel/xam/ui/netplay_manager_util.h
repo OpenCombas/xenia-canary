@@ -10,9 +10,18 @@
 #ifndef XENIA_KERNEL_XAM_UI_NETPLAY_MANAGER_UI_H_
 #define XENIA_KERNEL_XAM_UI_NETPLAY_MANAGER_UI_H_
 
+#include <cstdint>
+#include <future>
+#include <map>
+#include <memory>
+#include <set>
+
 #include "third_party/imgui/imgui.h"
 
 namespace xe {
+namespace ui {
+class ImmediateTexture;
+}  // namespace ui
 namespace kernel {
 namespace xam {
 namespace ui {
@@ -37,6 +46,11 @@ struct FriendsContentArgs {
   bool refresh_presence;
   AddFriendArgs add_friend_args = {};
   ImGuiTextFilter filter = {};
+  // Server-friend gamerpic fetch state (owned by xeDrawFriendsContent so every
+  // host of the friends list gets pics without duplicating the logic).
+  std::set<uint64_t> gamerpic_xuids = {};
+  std::future<std::map<uint64_t, std::shared_ptr<xe::ui::ImmediateTexture>>>
+      gamerpic_fetch = {};
 };
 
 struct SessionsContentArgs {

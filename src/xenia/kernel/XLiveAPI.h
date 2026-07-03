@@ -10,8 +10,14 @@
 #ifndef XENIA_KERNEL_XLIVEAPI_H_
 #define XENIA_KERNEL_XLIVEAPI_H_
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <future>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <unordered_set>
 
 #include "xenia/base/byte_order.h"
@@ -59,6 +65,8 @@ using gamerpics_pair = std::pair<std::vector<uint8_t>, std::vector<uint8_t>>;
 
 namespace kernel {
 
+class StandaloneSignalingBackend;
+
 class XLiveAPI {
  public:
   XLiveAPI();
@@ -92,6 +100,15 @@ class XLiveAPI {
 
   static std::string BuildEndpoint(std::string endpoint);
 
+  // Generic HTTP helpers (public so feature modules like PartyManager can call
+  // the WebServices REST API without duplicating the curl plumbing).
+  std::unique_ptr<HTTPResponseObjectJSON> Get(const std::string endpoint,
+                                              const uint32_t timeout = 0);
+  std::unique_ptr<HTTPResponseObjectJSON> Post(const std::string endpoint,
+                                               const uint8_t* data,
+                                               size_t data_size = 0);
+  std::unique_ptr<HTTPResponseObjectJSON> Delete(const std::string endpoint);
+
   void Init();
 
   InitState GetInitState() const;
@@ -109,6 +126,11 @@ class XLiveAPI {
   void StartWhoamiAsync();
 
   sockaddr_in Getwhoami();
+
+  // Fetch short-lived Cloudflare ICE STUN/TURN creds from WebServices GET /turn
+  // and push them into GNSTransport. Returns the server's ttl (seconds) so the
+  // caller can schedule a refresh, or 0 if unavailable / empty (cvar fallback).
+  uint32_t FetchTurnConfig();
 
   void DownloadPortMappings();
 
@@ -232,6 +254,12 @@ class XLiveAPI {
   std::future<std::map<uint64_t, std::shared_ptr<xe::ui::ImmediateTexture>>>
   GetFriendsGamerpicsAsync(const uint64_t xuid, ui::ImGuiDrawer* imgui_drawer);
 
+  // Same, but for an explicit XUID set (e.g. the server-authoritative friends
+  // list) rather than the profile's config friends.
+  std::future<std::map<uint64_t, std::shared_ptr<xe::ui::ImmediateTexture>>>
+  GetGamerpicsForXuidsAsync(std::set<uint64_t> xuids,
+                            ui::ImGuiDrawer* imgui_drawer);
+
   std::unique_ptr<HTTPResponseObjectJSON> PraseResponse(response_data response);
 
   std::future<std::vector<FriendPresenceObjectJSON>> GetFriendsPresenceAsync(
@@ -285,7 +313,41 @@ class XLiveAPI {
   inline static std::map<uint32_t, uint64_t> sessionIdCache = {};
   inline static std::map<uint32_t, uint64_t> macAddressCache = {};
 
+  // Thread-safe accessors for sessionIdCache. Guest threads populate it during
+  // XNet address resolution; the netplay voice send thread reads a snapshot to
+  // scope voice to session members, so all access must be serialized.
+  inline static std::mutex session_cache_mutex_ = {};
+  static void SetPeerSession(uint32_t inaOnline, uint64_t session_id);
+  static uint64_t GetPeerSession(uint32_t inaOnline);  // 0 if unknown
+  static std::map<uint32_t, uint64_t> SessionIdCacheSnapshot();
+
+  // Record a remote peer's online-IP -> MAC binding (the synthetic online IP is
+  // the guest's per-peer token; the 64-bit MAC is its stable cross-console id).
+  // Writes macAddressCache and mirrors the mapping into the GNS transport
+  // registry so guest sends to that online IP can route over GNS (Phase 4a).
+  // No-op for a zero MAC. Centralizes the single place these two address spaces
+  // meet; prefer this over writing macAddressCache directly.
+  static void CacheRemotePeerMac(uint32_t inaOnline, uint64_t mac);
+
  private:
+  // Bring up / tear down the GNS transport + signaling backend (Phase 5). Tied
+  // to netplay lifecycle: StartGNS from Init() once online, StopGNS from the
+  // destructor. No-ops unless the `gns` cvar is set.
+  void StartGNS();
+  void StopGNS();
+
+  // Background loop that re-fetches short-lived Cloudflare TURN creds from GET
+  // /turn every ~ttl/2 seconds (interruptibly) and pushes them into GNSTransport
+  // so relay auth never lapses mid-session. Started by StartGNS, stopped by
+  // StopGNS. No-op if /turn is empty (cvar fallback) — retries on the default.
+  void TurnRefreshLoop();
+  std::thread turn_refresh_thread_;
+  std::atomic<bool> turn_refresh_running_{false};
+  std::mutex turn_refresh_mutex_;
+  std::condition_variable turn_refresh_cv_;
+
+  std::unique_ptr<StandaloneSignalingBackend> gns_signaling_;
+
   const std::string default_local_server_ = "192.168.0.1:36000/";
 
   const std::string default_public_server_ =
@@ -309,18 +371,23 @@ class XLiveAPI {
 
   std::map<uint64_t, std::vector<uint8_t>> qos_payload_cache_ = {};
 
+  // Short-lived cache for QoSGet. The title polls XNetQosLookup (-> QoSGet) many
+  // times during a single session join, and a synchronous lookup BLOCKS the guest
+  // on the HTTP round-trip. Serving repeat gets within a small TTL from here
+  // collapses that burst into one request -- cutting webservices load and title
+  // hitching. The cached response_data.response buffer is heap-owned and never
+  // freed (HTTPResponseObjectJSON has an empty dtor), so it stays valid to return
+  // on hits; caching in fact reduces the per-call buffer leak.
+  struct QoSGetCacheEntry {
+    response_data data;
+    std::chrono::steady_clock::time_point fetched;
+  };
+  std::map<uint64_t, QoSGetCacheEntry> qos_get_cache_ = {};
+  std::mutex qos_get_cache_mutex_;
+
   std::future<sockaddr_in> whoami_result_;
 
   std::map<uint32_t, std::vector<uint8_t>> cached_gamerpics = {};
-
-  std::unique_ptr<HTTPResponseObjectJSON> Get(const std::string endpoint,
-                                              const uint32_t timeout = 0);
-
-  std::unique_ptr<HTTPResponseObjectJSON> Post(const std::string endpoint,
-                                               const uint8_t* data,
-                                               size_t data_size = 0);
-
-  std::unique_ptr<HTTPResponseObjectJSON> Delete(const std::string endpoint);
 
   std::vector<HTTPResponseObjectJSON> GetMulti(
       std::vector<std::string> urls, const uint32_t per_request_timeout = 0);
