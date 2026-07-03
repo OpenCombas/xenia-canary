@@ -16,6 +16,7 @@
 
 #include "xenia/app/emulator_window.h"
 #include "xenia/app/gamerpic_browser.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/jpeg_utils.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/png_utils.h"
@@ -25,6 +26,8 @@
 #include "xenia/kernel/xam/user_data.h"
 
 using namespace std::chrono_literals;
+
+DECLARE_string(gamerpic_api_address);
 
 namespace xe {
 namespace app {
@@ -191,7 +194,7 @@ void TitleGamerpicBrowser::OnDraw(ImGuiIO& io) {
       }
 
       ImGui::TableNextColumn();
-      std::string lbl_actual_source = "https://xboxgamer.pics/";
+      std::string lbl_actual_source = cvars::gamerpic_api_address;
 
       ImVec2 actual_source_size =
           ImGui::CalcTextSize(lbl_actual_source.c_str());

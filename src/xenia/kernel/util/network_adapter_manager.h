@@ -10,6 +10,7 @@
 #ifndef XENIA_KERNEL_XAM_NETWORK_ADAPTER_MANAGER
 #define XENIA_KERNEL_XAM_NETWORK_ADAPTER_MANAGER
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -61,6 +62,11 @@ class NetworkAdapterManager {
   sockaddr_in GetSelectedAdapterLocalIP() const { return local_ip_; }
 
   std::string GetSelectedAdapterLocalIPString() const;
+
+  // IPv6 unicast addresses on the selected adapter (16-byte network order), used
+  // to restrict GNS/ICE candidate gathering to the selected interface for v6 too
+  // (GetSelectedAdapterLocalIP covers only v4).
+  std::vector<std::array<uint8_t, 16>> GetSelectedAdapterLocalIPv6s() const;
 
   const std::vector<IP_ADAPTER_ADDRESSES>& GetAdapters() const {
     return adapter_addresses_;

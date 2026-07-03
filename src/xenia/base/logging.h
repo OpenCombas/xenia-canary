@@ -130,6 +130,15 @@ void AppendLogLine(LogLevel log_level, const char prefix_char,
                    const std::string_view str,
                    uint32_t log_mask = LogSrc::Uncategorized);
 
+// Non-blocking variant: if the log ring buffer is full, DROP the line instead of
+// spin-waiting for space (the normal AppendLogLine path). Returns true if the
+// line was fully queued, false if it was dropped or truncated. For
+// latency-critical producers -- e.g. a network service thread -- that must never
+// stall on logging even when another thread is flooding the log at debug level.
+bool AppendLogLineNoBlock(LogLevel log_level, const char prefix_char,
+                          const std::string_view str,
+                          uint32_t log_mask = LogSrc::Uncategorized);
+
 template <LogLevel ll>
 struct LoggerBatch {
   char* thrd_buf;       // current position in thread buffer

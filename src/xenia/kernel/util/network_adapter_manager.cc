@@ -8,6 +8,9 @@
  */
 
 #include "xenia/kernel/util/network_adapter_manager.h"
+
+#include <cstring>
+
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 
@@ -135,6 +138,48 @@ std::string NetworkAdapterManager::GetSelectedAdapterName() const {
 
 std::string NetworkAdapterManager::GetSelectedAdapterLocalIPString() const {
   return ip_to_string(local_ip_);
+}
+
+std::vector<std::array<uint8_t, 16>>
+NetworkAdapterManager::GetSelectedAdapterLocalIPv6s() const {
+  std::vector<std::array<uint8_t, 16>> out;
+  const std::string guid = cvars::network_guid;
+  if (guid.empty()) {
+    return out;
+  }
+
+  // DiscoverNetworkAdapters enumerates AF_INET only, so the cached adapter
+  // carries no IPv6 addresses. Do a dedicated IPv6 pass and match the selected
+  // adapter by GUID to collect its v6 unicast addresses (16-byte network order).
+  const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                      GAA_FLAG_SKIP_DNS_SERVER;
+  ULONG buffer_length = 0;
+  if (GetAdaptersAddresses(AF_INET6, flags, 0, nullptr, &buffer_length) !=
+      ERROR_BUFFER_OVERFLOW) {
+    return out;
+  }
+  std::vector<uint8_t> buffer(buffer_length);
+  auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+  if (GetAdaptersAddresses(AF_INET6, flags, 0, adapters, &buffer_length) !=
+      NO_ERROR) {
+    return out;
+  }
+  for (auto* a = adapters; a != nullptr; a = a->Next) {
+    if (guid != a->AdapterName) {
+      continue;
+    }
+    for (auto ua = a->FirstUnicastAddress; ua != nullptr; ua = ua->Next) {
+      const sockaddr* sa = ua->Address.lpSockaddr;
+      if (sa && sa->sa_family == AF_INET6) {
+        const auto* sa6 = reinterpret_cast<const sockaddr_in6*>(sa);
+        std::array<uint8_t, 16> bytes;
+        std::memcpy(bytes.data(), &sa6->sin6_addr, bytes.size());
+        out.push_back(bytes);
+      }
+    }
+    break;
+  }
+  return out;
 }
 
 bool NetworkAdapterManager::IsInterfaceSelected() const {

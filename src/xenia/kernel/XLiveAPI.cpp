@@ -16,11 +16,16 @@
 #include "third_party/libcurl/include/curl/curl.h"
 // clang-format on
 
+#include <algorithm>
+
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
+#include "xenia/base/threading.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/kernel/gns_signaling.h"
+#include "xenia/kernel/gns_transport.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/friends_util.h"
@@ -32,6 +37,18 @@ DEFINE_string(
     api_list, "https://xenia-netplay-2a0298c0e3f4.herokuapp.com/,",
     "Comma delimited list URL1, URL2 (Max 10). Set api_address during runtime.",
     "Live");
+
+DEFINE_string(gamerpic_api_address, "https://xboxgamer.pics",
+              "Base URL for the gamerpic metadata API (xboxgamer.pics-compatible "
+              "endpoints: /api/idlist, /api/title, /api/titles, /api/random). "
+              "Point at a self-hosted mirror to decouple from the upstream site. "
+              "No trailing slash.",
+              "Live");
+
+DEFINE_string(gamerpic_assets_address, "https://assets.xboxgamer.pics",
+              "Base URL for gamerpic image assets (/titles/<id>/<tile>.png). "
+              "No trailing slash.",
+              "Live");
 
 DEFINE_bool(logging, false, "Log Network Activity & Stats", "Live");
 
@@ -57,9 +74,20 @@ DEFINE_bool(
 
 DEFINE_bool(xhttp, false, "Toggles XHTTP.", "Live");
 
+DEFINE_int32(
+    qos_get_cache_ms, 500,
+    "Netplay: cache QoS data-blob GET responses (XNetQosLookup) for this many "
+    "milliseconds per session, collapsing the title's rapid re-polls into a "
+    "single HTTP request. Cuts webservices load and reduces title hitching on "
+    "synchronous lookups (which block the guest on the round-trip). 0 disables.",
+    "Live");
+
 DEFINE_int32(discord_presence_user_index, 0,
              "User profile index used for Discord rich presence [0, 3].",
              "Live");
+
+// Defined in gns_transport.cc.
+DECLARE_bool(gns_ice_ipv6);
 
 using namespace rapidjson;
 
@@ -76,7 +104,91 @@ namespace kernel {
 XLiveAPI::XLiveAPI() {}
 
 XLiveAPI::~XLiveAPI() {
+  StopGNS();
   // TODO(Adrian): Cleanup libcurl multiplexing handles.
+}
+
+void XLiveAPI::StartGNS() {
+  if (!GNSTransport::IsEnabled()) {
+    return;
+  }
+
+  const uint64_t local_peer_key = GetConsoleMacAddress().to_uint64();
+  if (!local_peer_key) {
+    XELOGW("GNS: no console MAC address; not starting GNS transport");
+    return;
+  }
+
+  // Restrict GNS/ICE to the config-selected network adapter (if any) so VPN /
+  // virtual NICs with no public route aren't bound as ICE host candidates and
+  // spam STUN. Zero = unrestricted (GNS uses all interfaces).
+  uint32_t gns_restrict_ipv4 = 0;
+  std::vector<std::array<uint8_t, 16>> gns_restrict_ipv6;
+  const auto gns_adapter =
+      kernel_state()->emulator()->GetNetworkAdapterManager();
+  if (gns_adapter && gns_adapter->IsInterfaceSelected()) {
+    gns_restrict_ipv4 =
+        ntohl(gns_adapter->GetSelectedAdapterLocalIP().sin_addr.s_addr);
+    // IPv6 host candidates are opt-in (gns_ice_ipv6): a global IPv6 that can't
+    // route to STUN/peers only adds dead candidate pairs + NAT flows. Leaving
+    // it out of the allowlist means the ICE client gathers no IPv6 host
+    // candidates; IPv4 host/reflexive/relay are unaffected.
+    if (cvars::gns_ice_ipv6) {
+      gns_restrict_ipv6 = gns_adapter->GetSelectedAdapterLocalIPv6s();
+    }
+  }
+
+  if (!GNSTransport::Get()->Initialize(local_peer_key, gns_restrict_ipv4,
+                                       gns_restrict_ipv6)) {
+    XELOGE("GNS: transport initialize failed; using native sockets only");
+    return;
+  }
+
+  // Learn peers from inbound connections/datagrams. A host only accepts inbound
+  // links and never resolves joiners' addresses, so it otherwise can't route
+  // back to them; with the deterministic MAC-derived synthetic IP, the guest_ina
+  // synthesized here from the inbound peer_key equals the value that peer
+  // advertised, so the reverse mapping is correct without any lookup.
+  GNSTransport::Get()->set_auto_register_inbound(true);
+
+  // Fetch short-lived Cloudflare STUN/TURN creds and start the refresh loop.
+  // Runs before signaling so the first P2P connection already has relay auth.
+  // Empty /turn (or failure) leaves the cvar ICE config in place.
+  if (!turn_refresh_running_.exchange(true)) {
+    turn_refresh_thread_ = std::thread([this]() { TurnRefreshLoop(); });
+  }
+
+  // Bring up signaling; without a relay URL peers can't establish P2P, but the
+  // transport stays up (already-mapped/loopback paths still work as before).
+  gns_signaling_ = std::make_unique<StandaloneSignalingBackend>();
+  if (gns_signaling_->Start(local_peer_key)) {
+    GNSTransport::Get()->SetSignalingBackend(gns_signaling_.get());
+    XELOGI("GNS: transport + signaling started");
+  } else {
+    gns_signaling_.reset();
+    XELOGW(
+        "GNS: signaling backend not started (set gns_signaling_url); peers "
+        "cannot connect over GNS");
+  }
+}
+
+void XLiveAPI::StopGNS() {
+  // Stop the TURN refresh loop first (it does blocking HTTP + touches GNS).
+  if (turn_refresh_running_.exchange(false)) {
+    turn_refresh_cv_.notify_all();
+    if (turn_refresh_thread_.joinable()) {
+      turn_refresh_thread_.join();
+    }
+  }
+
+  // Detach the backend before tearing it down so no in-flight GNS callback
+  // dereferences it, then stop the worker and the transport pump.
+  GNSTransport::Get()->SetSignalingBackend(nullptr);
+  if (gns_signaling_) {
+    gns_signaling_->Stop();
+    gns_signaling_.reset();
+  }
+  GNSTransport::Get()->Shutdown();
 }
 
 void XLiveAPI::IpGetConsoleXnAddr(XNADDR* XnAddr_ptr) {
@@ -90,7 +202,21 @@ void XLiveAPI::IpGetConsoleXnAddr(XNADDR* XnAddr_ptr) {
   const auto xbl_api = kernel_state()->GetXboxLiveAPI();
 
   if (cvars::network_mode != NETWORK_MODE::OFFLINE) {
-    if (xbl_api->IsConnectedToServer() && is_WAN_routing) {
+    const uint64_t local_key = GetConsoleMacAddress().to_uint64();
+    if (GNSTransport::IsEnabled() && GNSTransport::Get()->initialized() &&
+        local_key) {
+      // Under GNS, advertise a synthetic MAC-derived private-subnet online IP
+      // instead of the real public IP. The public IP is unreachable peer-to-peer
+      // (NAT) and absent from the GNS registry, so the title's peer-mesh
+      // handshake (post-XSessionStart, state 40->48) never completes; a
+      // registered 10/8 address both looks LAN-adjacent (as Tailscale does for
+      // native play) and routes over GNS. Peers re-derive this same value from
+      // our MAC, so it is self-consistent without any address exchange.
+      const uint32_t synth = GNSTransport::SyntheticInaFromPeerKey(local_key);
+      XnAddr_ptr->ina.s_addr = synth;
+      XnAddr_ptr->inaOnline.s_addr = synth;
+      CacheRemotePeerMac(synth, local_key);
+    } else if (xbl_api->IsConnectedToServer() && is_WAN_routing) {
       XnAddr_ptr->ina = xbl_api->OnlineIP().sin_addr;
       XnAddr_ptr->inaOnline = xbl_api->OnlineIP().sin_addr;
     } else {
@@ -113,10 +239,23 @@ void XLiveAPI::GetXnAddrFromSessionObject(SessionObjectJSON session,
                                           XNADDR* XnAddr_ptr) {
   memset(XnAddr_ptr, 0, sizeof(XNADDR));
 
-  XnAddr_ptr->inaOnline = ip_to_in_addr(session.HostAddress());
-  XnAddr_ptr->ina = ip_to_in_addr(session.HostAddress());
-
   const MacAddress mac_address = MacAddress(session.MacAddress());
+  const uint64_t peer_key = mac_address.to_uint64();
+
+  if (GNSTransport::IsEnabled() && GNSTransport::Get()->initialized() &&
+      peer_key) {
+    // Match IpGetConsoleXnAddr: under GNS the peer advertises a synthetic
+    // MAC-derived online IP, so resolve this member to the same value (we hold
+    // its MAC here) and register it, instead of the unusable public HostAddress.
+    const uint32_t synth = GNSTransport::SyntheticInaFromPeerKey(peer_key);
+    XnAddr_ptr->inaOnline.s_addr = synth;
+    XnAddr_ptr->ina.s_addr = synth;
+    CacheRemotePeerMac(synth, peer_key);
+  } else {
+    XnAddr_ptr->inaOnline = ip_to_in_addr(session.HostAddress());
+    XnAddr_ptr->ina = ip_to_in_addr(session.HostAddress());
+  }
+
   memcpy(XnAddr_ptr->abEnet, mac_address.raw(), MacAddress::MacAddressSize);
 
   XnAddr_ptr->wPortOnline = session.Port();
@@ -325,8 +464,15 @@ void XLiveAPI::Init() {
 
   initialized_ = InitState::Success;
 
-  // Delete sessions on start-up.
-  DeleteAllSessions();
+  // Bring up GNS NAT traversal now that we're online and have our identity.
+  StartGNS();
+
+  // Delete sessions on start-up. Scope by our console MAC: under GNS our real
+  // HTTP source IP no longer equals our synthetic hostAddress, so the MAC-less
+  // variant matches nothing server-side and leaves our own stale sessions from a
+  // previous run lingering (which then poison session search into found-0 /
+  // parallel-lobby churn). The MAC path deletes exactly our sessions.
+  DeleteAllSessionsByMac();
 }
 
 XLiveAPI::InitState XLiveAPI::GetInitState() const { return initialized_; }
@@ -344,9 +490,54 @@ uint16_t XLiveAPI::GetPlayerPort() const { return 36000; }
 
 int8_t XLiveAPI::GetVersionStatus() const { return version_status_; }
 
+void XLiveAPI::SetPeerSession(uint32_t inaOnline, uint64_t session_id) {
+  std::lock_guard<std::mutex> lock(session_cache_mutex_);
+  sessionIdCache[inaOnline] = session_id;
+}
+
+uint64_t XLiveAPI::GetPeerSession(uint32_t inaOnline) {
+  std::lock_guard<std::mutex> lock(session_cache_mutex_);
+  auto it = sessionIdCache.find(inaOnline);
+  return it != sessionIdCache.end() ? it->second : 0;
+}
+
+std::map<uint32_t, uint64_t> XLiveAPI::SessionIdCacheSnapshot() {
+  std::lock_guard<std::mutex> lock(session_cache_mutex_);
+  return sessionIdCache;  // copy under lock for cross-thread readers
+}
+
 void XLiveAPI::clearXnaddrCache() {
-  sessionIdCache.clear();
+  {
+    std::lock_guard<std::mutex> lock(session_cache_mutex_);
+    sessionIdCache.clear();
+  }
+
+  // Drop the mirrored GNS peer registry entries before forgetting the cache, so
+  // a stale online IP can't keep routing over GNS after a session teardown.
+  if (GNSTransport::IsEnabled()) {
+    auto* transport = GNSTransport::Get();
+    for (const auto& [inaOnline, mac] : macAddressCache) {
+      transport->UnmapPeer(inaOnline);
+    }
+  }
+
   macAddressCache.clear();
+}
+
+void XLiveAPI::CacheRemotePeerMac(uint32_t inaOnline, uint64_t mac) {
+  macAddressCache[inaOnline] = mac;
+
+  // Mirror into the GNS registry so XSocket can route guest UDP/VDP destined
+  // for this online IP over GNS (Phase 4a). The MAC is the symmetric peer_key:
+  // each end derives the same key for a given console. Never mirror our OWN
+  // console: the local member appears in its own session roster, and mapping
+  // self makes the title's sends to its own online IP resolve to a GNS
+  // session-to-self (endless SendMessageToUser ConnectFailed). Self traffic
+  // belongs on the loopback/native path, not P2P.
+  if (mac && GNSTransport::IsEnabled() &&
+      mac != GetConsoleMacAddress().to_uint64()) {
+    GNSTransport::Get()->MapPeer(inaOnline, mac);
+  }
 }
 
 // Request data from the server
@@ -648,8 +839,18 @@ void XLiveAPI::StartWhoamiAsync() {
 
 // Check connection to xenia web server.
 sockaddr_in XLiveAPI::Getwhoami() {
-  std::unique_ptr<HTTPResponseObjectJSON> response =
-      Get(BuildEndpoint("whoami"));
+  // Under GNS the authoritative online IP is the MAC-derived synthetic. Supplying
+  // the console MAC makes /whoami return SyntheticInaFromPeerKey(mac) instead of
+  // the real public IP, so online_ip_ (-> hostAddress POST, FindPlayer lookups)
+  // agrees with the synthetic the title advertises via IpGetConsoleXnAddr and
+  // with what the server now stores as hostAddress. Non-GNS titles keep the
+  // legacy real-IP echo.
+  std::string endpoint = "whoami";
+  if (GNSTransport::IsEnabled()) {
+    endpoint += fmt::format("?mac={}", GetConsoleMacAddress().to_string());
+  }
+
+  std::unique_ptr<HTTPResponseObjectJSON> response = Get(BuildEndpoint(endpoint));
 
   sockaddr_in addr{};
 
@@ -669,6 +870,91 @@ sockaddr_in XLiveAPI::Getwhoami() {
   }
 
   return addr;
+}
+
+uint32_t XLiveAPI::FetchTurnConfig() {
+  // Only meaningful under GNS (the ICE client is what consumes STUN/TURN).
+  if (!GNSTransport::IsEnabled()) {
+    return 0;
+  }
+  GNSTransport* gns = GNSTransport::Get();
+  if (!gns) {
+    return 0;
+  }
+
+  std::unique_ptr<HTTPResponseObjectJSON> response =
+      Get(BuildEndpoint("turn"));
+
+  if (response->StatusCode() != HTTP_STATUS_CODE::HTTP_OK) {
+    XELOGW("[GNS] /turn returned HTTP {}; keeping cvar ICE config",
+           static_cast<int>(response->StatusCode()));
+    return 0;
+  }
+
+  Document doc;
+  doc.Parse(response->RawResponse().response);
+  if (doc.HasParseError() || !doc.IsObject()) {
+    XELOGW("[GNS] /turn response unparseable; keeping cvar ICE config");
+    return 0;
+  }
+
+  // Contract: {stunServers, turnServers, turnUsername, turnCredential, ttl}.
+  // Comma-joined url lists; a SINGLE turnUsername/turnCredential applies to
+  // every turn url (GNSTransport repeats it to the url count). An unset/errored
+  // server config yields all-empty strings + ttl 0 -> we clear the override and
+  // GNSTransport falls back to the gns_stun_/gns_turn_ cvars.
+  auto get_str = [&doc](const char* key) -> std::string {
+    if (doc.HasMember(key) && doc[key].IsString()) {
+      return doc[key].GetString();
+    }
+    return std::string();
+  };
+
+  const std::string stun = get_str("stunServers");
+  const std::string turn = get_str("turnServers");
+  const std::string turn_user = get_str("turnUsername");
+  const std::string turn_pass = get_str("turnCredential");
+  uint32_t ttl = 0;
+  if (doc.HasMember("ttl") && doc["ttl"].IsUint()) {
+    ttl = doc["ttl"].GetUint();
+  }
+
+  gns->SetIceServers(stun, turn, turn_user, turn_pass);
+
+  if (stun.empty() && turn.empty()) {
+    XELOGI("[GNS] /turn empty; using cvar ICE config");
+  } else {
+    XELOGI("[GNS] /turn config applied (ttl {}s)", ttl);
+  }
+  return ttl;
+}
+
+void XLiveAPI::TurnRefreshLoop() {
+  xe::threading::set_name("XLive TURN Refresh");
+
+  // Cloudflare creds are short-lived; refresh at ttl/2 to always have a valid
+  // set before the old one expires. Bounds keep a bogus ttl from busy-looping
+  // or effectively never refreshing.
+  constexpr uint32_t kMinRefreshSecs = 60;
+  constexpr uint32_t kMaxRefreshSecs = 3600;
+  // When /turn is empty/unavailable (cvar fallback) retry occasionally in case
+  // server-side config comes online, without hammering it.
+  constexpr uint32_t kEmptyRetrySecs = 300;
+
+  while (turn_refresh_running_.load()) {
+    const uint32_t ttl = FetchTurnConfig();
+
+    uint32_t wait_secs;
+    if (ttl == 0) {
+      wait_secs = kEmptyRetrySecs;
+    } else {
+      wait_secs = std::clamp(ttl / 2, kMinRefreshSecs, kMaxRefreshSecs);
+    }
+
+    std::unique_lock<std::mutex> lock(turn_refresh_mutex_);
+    turn_refresh_cv_.wait_for(lock, std::chrono::seconds(wait_secs),
+                              [this]() { return !turn_refresh_running_.load(); });
+  }
 }
 
 void XLiveAPI::DownloadPortMappings() {
@@ -822,7 +1108,13 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::RegisterPlayer(
 }
 
 const std::map<uint64_t, std::string> XLiveAPI::DeleteMyProfiles() {
-  std::string endpoint = BuildEndpoint("players/deletemyprofiles");
+  // Authorize by console MAC: under server-authoritative synthetic IPs the real
+  // HTTP source IP no longer equals our synthetic hostAddress, so the server
+  // needs the MAC to match our profiles/sessions (it falls back to RealIP when
+  // absent).
+  std::string endpoint = BuildEndpoint(fmt::format(
+      "players/deletemyprofiles?macAddress={}",
+      GetConsoleMacAddress().to_string()));
 
   std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint);
 
@@ -896,11 +1188,33 @@ void XLiveAPI::QoSPost(uint64_t sessionId, uint8_t* qosData, size_t qosLength) {
     return;
   }
 
+  // Drop any stale local GET cache for this session so a same-instance lookup
+  // after we just posted sees the fresh blob (cross-instance staleness is bounded
+  // by the TTL).
+  {
+    std::lock_guard<std::mutex> lock(qos_get_cache_mutex_);
+    qos_get_cache_.erase(sessionId);
+  }
+
   XELOGI("Sent QoS data.");
 }
 
 // Get QoS binary data from the server
 response_data XLiveAPI::QoSGet(uint64_t sessionId) {
+  const int64_t ttl_ms = cvars::qos_get_cache_ms;
+
+  // Serve a fresh cached response without touching the endpoint. The title polls
+  // this heavily during a join and a sync lookup blocks the guest on the fetch.
+  if (ttl_ms > 0) {
+    std::lock_guard<std::mutex> lock(qos_get_cache_mutex_);
+    auto it = qos_get_cache_.find(sessionId);
+    if (it != qos_get_cache_.end() &&
+        std::chrono::steady_clock::now() - it->second.fetched <
+            std::chrono::milliseconds(ttl_ms)) {
+      return it->second.data;
+    }
+  }
+
   std::string endpoint =
       BuildEndpoint(fmt::format("title/{:08X}/sessions/{:016x}/qos",
                                 kernel_state()->title_id(), sessionId));
@@ -912,12 +1226,17 @@ response_data XLiveAPI::QoSGet(uint64_t sessionId) {
     XELOGE("QoSGet error message: {}", response->Message());
     assert_always();
 
-    return response->RawResponse();
+    return response->RawResponse();  // errors are not cached
   }
 
   XELOGI("Requesting QoS data.");
 
-  return response->RawResponse();
+  const response_data data = response->RawResponse();
+  if (ttl_ms > 0) {
+    std::lock_guard<std::mutex> lock(qos_get_cache_mutex_);
+    qos_get_cache_[sessionId] = {data, std::chrono::steady_clock::now()};
+  }
+  return data;
 }
 
 void XLiveAPI::SessionModify(uint64_t sessionId, XGI_SESSION_MODIFY* data) {
@@ -1216,8 +1535,14 @@ std::unique_ptr<LeaderboardObjectJSON> XLiveAPI::LeaderboardsFind(
 }
 
 void XLiveAPI::DeleteSession(uint64_t sessionId) {
-  std::string endpoint = BuildEndpoint(fmt::format(
-      "title/{:08X}/sessions/{:016x}", kernel_state()->title_id(), sessionId));
+  // Pass the console MAC so the server can authorize the delete against the
+  // session's stored host MAC: with server-authoritative synthetic IPs our real
+  // source IP no longer matches the synthetic hostAddress (server falls back to
+  // RealIP when the MAC is absent).
+  std::string endpoint = BuildEndpoint(
+      fmt::format("title/{:08X}/sessions/{:016x}?macAddress={}",
+                  kernel_state()->title_id(), sessionId,
+                  GetConsoleMacAddress().to_string()));
 
   std::unique_ptr<HTTPResponseObjectJSON> response = Delete(endpoint);
 
@@ -2054,9 +2379,24 @@ std::vector<uint8_t> XLiveAPI::GetUserGamerpicTile(uint64_t xuid,
   return gamerpic;
 }
 
+// Gamerpic source base URLs (cvars), trimmed of any trailing slash so callers
+// can compose paths that begin with '/'. Default to xboxgamer.pics; point at a
+// self-hosted mirror to decouple from the upstream site.
+static std::string GamerpicApiBase() {
+  std::string base = cvars::gamerpic_api_address;
+  while (!base.empty() && base.back() == '/') base.pop_back();
+  return base;
+}
+
+static std::string GamerpicAssetsBase() {
+  std::string base = cvars::gamerpic_assets_address;
+  while (!base.empty() && base.back() == '/') base.pop_back();
+  return base;
+}
+
 TitleGamerpicsObjectJSON XLiveAPI::GetTitleGamerpic(uint32_t title_id) {
   const std::string endpoint =
-      fmt::format("https://xboxgamer.pics/api/title/{:08x}", title_id);
+      fmt::format("{}/api/title/{:08x}", GamerpicApiBase(), title_id);
 
   std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint);
 
@@ -2071,7 +2411,7 @@ TitleGamerpicsObjectJSON XLiveAPI::GetTitleGamerpic(uint32_t title_id) {
 }
 
 std::set<uint32_t> XLiveAPI::GetSupportedGamerpicTitles() {
-  const std::string endpoint = "https://xboxgamer.pics/api/idlist";
+  const std::string endpoint = fmt::format("{}/api/idlist", GamerpicApiBase());
 
   std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint);
 
@@ -2104,7 +2444,7 @@ std::set<uint32_t> XLiveAPI::GetSupportedGamerpicTitles() {
 std::optional<PageGamerpicsObjectJSON> XLiveAPI::GetGamerpicPage(
     uint32_t page, uint32_t per_page, std::string type_query) {
   const std::string endpoint = fmt::format(
-      "https://xboxgamer.pics/api/titles?page={}&per_page={}&type={}", page,
+      "{}/api/titles?page={}&per_page={}&type={}", GamerpicApiBase(), page,
       per_page, type_query.c_str());
 
   std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint);
@@ -2128,7 +2468,7 @@ std::map<uint32_t, std::vector<uint8_t>> XLiveAPI::GetMultiGameInfo(
   std::vector<std::string> urls = {};
 
   for (const auto& [title_id, image] : images_data) {
-    urls.push_back(fmt::format("https://assets.xboxgamer.pics/titles/{:x}/{}",
+    urls.push_back(fmt::format("{}/titles/{:x}/{}", GamerpicAssetsBase(),
                                title_id, image));
   }
 
@@ -2169,7 +2509,7 @@ std::map<uint32_t, std::vector<uint8_t>> XLiveAPI::GetMultiGamerpics(
   std::vector<std::string> urls = {};
 
   for (const auto& cdn : cdn_parts) {
-    urls.push_back(fmt::format("https://assets.xboxgamer.pics{}", cdn));
+    urls.push_back(fmt::format("{}{}", GamerpicAssetsBase(), cdn));
   }
 
   std::vector<HTTPResponseObjectJSON> gamerpics_data = GetMulti(urls, 5);
@@ -2208,7 +2548,7 @@ std::map<uint32_t, std::vector<uint8_t>> XLiveAPI::GetMultiGamerpics(
 std::vector<uint8_t> XLiveAPI::DownloadGamerpicTile(uint32_t title_id,
                                                     uint32_t tile_id) {
   const std::string gamerpic_url = fmt::format(
-      "https://assets.xboxgamer.pics/titles/{:x}/{:x}.png", title_id, tile_id);
+      "{}/titles/{:x}/{:x}.png", GamerpicAssetsBase(), title_id, tile_id);
 
   std::vector<uint8_t> tile = XStorageDownload(gamerpic_url);
 
@@ -2315,7 +2655,7 @@ std::shared_future<gamerpics_pair> XLiveAPI::DownloadCompleteGamerpic(
 
 std::vector<uint8_t> XLiveAPI::DownloadRandomGamerpic() {
   const std::string endpoint =
-      fmt::format("https://xboxgamer.pics/api/random/gamerpics?count=1");
+      fmt::format("{}/api/random/gamerpics?count=1", GamerpicApiBase());
 
   std::unique_ptr<HTTPResponseObjectJSON> response = Get(endpoint);
 
@@ -2344,7 +2684,7 @@ std::vector<uint8_t> XLiveAPI::DownloadRandomGamerpic() {
   }
 
   const std::string endpoint_gamerpic =
-      fmt::format("https://xboxgamer.pics/{}", gamerpic_path);
+      fmt::format("{}/{}", GamerpicApiBase(), gamerpic_path);
 
   std::vector<uint8_t> tile = XStorageDownload(endpoint_gamerpic);
 
